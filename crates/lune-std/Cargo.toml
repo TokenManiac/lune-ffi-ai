@@ -14,6 +14,7 @@ workspace = true
 
 [features]
 default = [
+    "ffi",
     "datetime",
     "fs",
     "luau",
@@ -36,6 +37,7 @@ roblox = ["dep:lune-std-roblox"]
 serde = ["dep:lune-std-serde"]
 stdio = ["dep:lune-std-stdio"]
 task = ["dep:lune-std-task"]
+ffi = ["dep:lune-std-ffi"]
 
 [dependencies]
 mlua = { version = "0.11.3", features = ["luau"] }
@@ -60,3 +62,4 @@ lune-std-roblox = { optional = true, version = "0.3.2", path = "../lune-std-robl
 lune-std-serde = { optional = true, version = "0.3.2", path = "../lune-std-serde" }
 lune-std-stdio = { optional = true, version = "0.3.2", path = "../lune-std-stdio" }
 lune-std-task = { optional = true, version = "0.3.2", path = "../lune-std-task" }
+lune-std-ffi = { optional = true, version = "0.3.2", path = "../lune-std-ffi" }
