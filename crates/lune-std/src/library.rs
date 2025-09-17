@@ -8,6 +8,7 @@ use mlua::prelude::*;
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 #[rustfmt::skip]
 pub enum LuneStandardLibrary {
+    #[cfg(feature = "ffi")]      Ffi,
     #[cfg(feature = "datetime")] DateTime,
     #[cfg(feature = "fs")]       Fs,
     #[cfg(feature = "luau")]     Luau,
@@ -26,6 +27,7 @@ impl LuneStandardLibrary {
     */
     #[rustfmt::skip]
     pub const ALL: &'static [Self] = &[
+        #[cfg(feature = "ffi")]      Self::Ffi,
         #[cfg(feature = "datetime")] Self::DateTime,
         #[cfg(feature = "fs")]       Self::Fs,
         #[cfg(feature = "luau")]     Self::Luau,
@@ -46,6 +48,7 @@ impl LuneStandardLibrary {
     #[allow(unreachable_patterns)]
     pub fn name(&self) -> &'static str {
         match self {
+            #[cfg(feature = "ffi")]      Self::Ffi      => "ffi",
             #[cfg(feature = "datetime")] Self::DateTime => "datetime",
             #[cfg(feature = "fs")]       Self::Fs       => "fs",
             #[cfg(feature = "luau")]     Self::Luau     => "luau",
@@ -69,6 +72,7 @@ impl LuneStandardLibrary {
     #[allow(unreachable_patterns)]
     pub fn typedefs(&self) -> String {
     	match self {
+            #[cfg(feature = "ffi")]      Self::Ffi      => lune_std_ffi::typedefs(),
             #[cfg(feature = "datetime")] Self::DateTime => lune_std_datetime::typedefs(),
             #[cfg(feature = "fs")]       Self::Fs       => lune_std_fs::typedefs(),
             #[cfg(feature = "luau")]     Self::Luau     => lune_std_luau::typedefs(),
@@ -96,6 +100,7 @@ impl LuneStandardLibrary {
     pub fn module(&self, lua: Lua) -> LuaResult<LuaTable> {
         let mod_lua = lua.clone();
         let res: LuaResult<LuaTable> = match self {
+            #[cfg(feature = "ffi")]      Self::Ffi      => lune_std_ffi::module(mod_lua),
             #[cfg(feature = "datetime")] Self::DateTime => lune_std_datetime::module(mod_lua),
             #[cfg(feature = "fs")]       Self::Fs       => lune_std_fs::module(mod_lua),
             #[cfg(feature = "luau")]     Self::Luau     => lune_std_luau::module(mod_lua),
@@ -125,6 +130,7 @@ impl FromStr for LuneStandardLibrary {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let low = s.trim().to_ascii_lowercase();
         Ok(match low.as_str() {
+            #[cfg(feature = "ffi")]      "ffi"      => Self::Ffi,
             #[cfg(feature = "datetime")] "datetime" => Self::DateTime,
             #[cfg(feature = "fs")]       "fs"       => Self::Fs,
             #[cfg(feature = "luau")]     "luau"     => Self::Luau,

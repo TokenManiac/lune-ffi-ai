@@ -1668,6 +1668,7 @@ dependencies = [
  "async-fs",
  "async-lock",
  "lune-std-datetime",
+ "lune-std-ffi",
  "lune-std-fs",
  "lune-std-luau",
  "lune-std-net",
@@ -1693,6 +1694,16 @@ dependencies = [
  "lune-utils",
  "mlua",
  "thiserror 2.0.16",
+]
+
+[[package]]
+name = "lune-std-ffi"
+version = "0.3.2"
+dependencies = [
+ "cc",
+ "cfg-if 1.0.3",
+ "lune-utils",
+ "mlua",
 ]
 
 [[package]]
