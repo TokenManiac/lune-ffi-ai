@@ -2,9 +2,13 @@
 
 use mlua::prelude::*;
 
+mod call;
 mod native;
 
-const MODULE_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/ffi/src/init.luau"));
+const MODULE_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../packages/ffi/src/init.luau"
+));
 const TYPEDEFS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/types.d.luau"));
 
 #[must_use]

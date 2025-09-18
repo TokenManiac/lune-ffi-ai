@@ -4,12 +4,24 @@ use std::path::PathBuf;
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let native_dir = manifest_dir
-        .join("..").join("..")
-        .join("packages").join("ffi").join("native");
+        .join("..")
+        .join("..")
+        .join("packages")
+        .join("ffi")
+        .join("native");
 
-    println!("cargo:rerun-if-changed={}", native_dir.join("luneffi_loader.h").display());
-    println!("cargo:rerun-if-changed={}", native_dir.join("luneffi_loader_posix.c").display());
-    println!("cargo:rerun-if-changed={}", native_dir.join("luneffi_loader_windows.c").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("luneffi_loader.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("luneffi_loader_posix.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("luneffi_loader_windows.c").display()
+    );
 
     let mut build = cc::Build::new();
     build.include(&native_dir);

@@ -2,7 +2,7 @@
 
 - [x] Create `@lune/ffi` package scaffolding (src, tests, examples, docs, CI)
 - [x] Implement loader native shim (POSIX/Windows) + Luau wrapper
-- [ ] Implement call bridge (cdecl + Windows stdcall/ms_abi), basic varargs
+- [ ] Implement call bridge (cdecl + Windows stdcall/ms_abi), basic varargs *(in progress: native call trampoline + debug invocation helpers; TODO varargs + integration with parser)*
 - [ ] `ffi.cdef` parser (typedefs, enums, structs/unions, bitfields basic)
 - [ ] `ffi.new`, `ffi.typeof`, `ffi.cast`, `ffi.string`
 - [ ] `ffi.sizeof`, `ffi.alignof`, `ffi.offsetof`
