@@ -3,6 +3,8 @@ use std::os::raw::{c_char, c_int, c_void};
 
 use mlua::prelude::*;
 
+use crate::call;
+
 #[allow(improper_ctypes)]
 unsafe extern "C" {
     fn luneffi_dlopen(path: *const c_char) -> *mut c_void;
@@ -24,16 +26,16 @@ pub fn create(lua: &Lua) -> LuaResult<LuaTable> {
     let table = lua.create_table()?;
 
     let dlopen_fn = lua.create_function(|_, path: Option<String>| {
-        let c_path = match path {
-            Some(ref p) => Some(CString::new(p.as_str()).map_err(|_| {
-                LuaError::runtime(format!("Library path contains NUL byte: {p}"))
-            })?),
-            None => None,
-        };
+        let c_path =
+            match path {
+                Some(ref p) => Some(CString::new(p.as_str()).map_err(|_| {
+                    LuaError::runtime(format!("Library path contains NUL byte: {p}"))
+                })?),
+                None => None,
+            };
 
-        let ptr = unsafe {
-            luneffi_dlopen(c_path.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()))
-        };
+        let ptr =
+            unsafe { luneffi_dlopen(c_path.as_ref().map_or(std::ptr::null(), |s| s.as_ptr())) };
 
         if ptr.is_null() {
             let err = last_error().unwrap_or_else(|| "Failed to load library".to_string());
@@ -45,9 +47,8 @@ pub fn create(lua: &Lua) -> LuaResult<LuaTable> {
     table.set("dlopen", dlopen_fn)?;
 
     let dlsym_fn = lua.create_function(|lua, (handle, name): (LuaLightUserData, String)| {
-        let c_name = CString::new(name.as_str()).map_err(|_| {
-            LuaError::runtime(format!("Symbol name contains NUL byte: {name}"))
-        })?;
+        let c_name = CString::new(name.as_str())
+            .map_err(|_| LuaError::runtime(format!("Symbol name contains NUL byte: {name}")))?;
         let ptr = unsafe { luneffi_dlsym(handle.0, c_name.as_ptr()) };
         if ptr.is_null() {
             let err = last_error().unwrap_or_else(|| "symbol lookup failed".to_string());
@@ -69,6 +70,13 @@ pub fn create(lua: &Lua) -> LuaResult<LuaTable> {
         Ok(())
     })?;
     table.set("dlclose", dlclose_fn)?;
+
+    let call_fn = lua.create_function(
+        |lua, (func, signature, args): (LuaLightUserData, LuaTable, LuaTable)| {
+            call::call(lua, func, signature, args)
+        },
+    )?;
+    table.set("call", call_fn)?;
 
     Ok(table)
 }

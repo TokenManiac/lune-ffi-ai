@@ -3,11 +3,77 @@ local native = select(1, ...)
 export type NativeHandle = lightuserdata
 
 type LibraryState = {
-handle: NativeHandle?,
-name: string,
-autoClose: boolean,
-symbols: { [string]: any },
+    handle: NativeHandle?,
+    name: string,
+    autoClose: boolean,
+    symbols: { [string]: any },
 }
+
+type CTypeDescriptor = {
+    kind: string,
+    code: string,
+    [string]: any,
+}
+
+type FunctionSignature = {
+    kind: string,
+    result: CTypeDescriptor,
+    args: { CTypeDescriptor },
+    abi: string?,
+    variadic: boolean?,
+    fixedCount: number?,
+}
+
+local registry = {
+    functions = {} :: { [string]: FunctionSignature },
+}
+
+local function register_function(name: string, signature: FunctionSignature)
+    if type(name) ~= "string" then
+        error("symbol name must be a string", 2)
+    end
+    if type(signature) ~= "table" then
+        error("function signature must be a table", 2)
+    end
+    if signature.kind ~= "function" then
+        error("expected function signature with kind = 'function'", 2)
+    end
+    if type(signature.result) ~= "table" then
+        error("function signature requires a result type", 2)
+    end
+
+    local args = signature.args or {}
+    if type(args) ~= "table" then
+        error("function signature args must be an array", 2)
+    end
+
+    local normalizedArgs = table.create(#args)
+    for index = 1, #args do
+        normalizedArgs[index] = args[index]
+    end
+
+    local fixedCount = signature.fixedCount
+    if fixedCount == nil then
+        fixedCount = #normalizedArgs
+    elseif type(fixedCount) ~= "number" then
+        error("function signature fixedCount must be a number", 2)
+    elseif fixedCount > #normalizedArgs then
+        error("function signature fixedCount exceeds number of arguments", 2)
+    end
+
+    registry.functions[name] = {
+        kind = "function",
+        result = signature.result,
+        args = normalizedArgs,
+        abi = signature.abi,
+        variadic = signature.variadic,
+        fixedCount = fixedCount,
+    }
+end
+
+local function get_function_signature(name: string): FunctionSignature?
+    return registry.functions[name]
+end
 
 local function todo(name: string): ()
 error(string.format("TODO(@lune/ffi): %s not implemented yet", name), 2)
@@ -24,10 +90,23 @@ local symbol_mt = {}
 symbol_mt.__index = symbol_mt
 
 function symbol_mt:__call(...)
-error(string.format(
-"TODO(@lune/ffi/callbridge): invoke symbol '%s'",
-self.__name
-), 2)
+    local signature = get_function_signature(self.__name)
+    if not signature then
+        error(string.format("No ctype registered for symbol '%s'", self.__name), 2)
+    end
+
+    local packed = table.pack(...)
+    local args = table.create(packed.n)
+    for index = 1, packed.n do
+        args[index] = packed[index]
+    end
+    args.n = packed.n
+
+    local ok, result = pcall(native.call, self.__ptr, signature, args)
+    if not ok then
+        error(result, 2)
+    end
+    return result
 end
 
 function symbol_mt:__tostring()
@@ -99,7 +178,7 @@ end
 local ffi = {}
 
 function ffi.cdef(_: string)
-todo("ffi.cdef")
+    todo("ffi.cdef")
 end
 
 function ffi.load(libnameOrPath: string?): any
@@ -159,5 +238,46 @@ end
 
 ffi.os = "unknown"
 ffi.arch = "unknown"
+
+local debug = {}
+
+function debug.primitive(code: string): CTypeDescriptor
+    if type(code) ~= "string" then
+        error("primitive code must be a string", 2)
+    end
+    return { kind = "primitive", code = code }
+end
+
+function debug.pointer(base: CTypeDescriptor?): CTypeDescriptor
+    return { kind = "pointer", code = "pointer", base = base }
+end
+
+function debug.functionSignature(
+    result: CTypeDescriptor,
+    args: { CTypeDescriptor }?,
+    opts: { abi: string?, variadic: boolean?, fixedCount: number? }?
+): FunctionSignature
+    local list = {}
+    if args then
+        for index = 1, #args do
+            list[index] = args[index]
+        end
+    end
+    local fixedCount = if opts and opts.fixedCount then opts.fixedCount else #list
+    return {
+        kind = "function",
+        result = result,
+        args = list,
+        abi = if opts then opts.abi else nil,
+        variadic = if opts then opts.variadic else nil,
+        fixedCount = fixedCount,
+    }
+end
+
+function debug.register(name: string, signature: FunctionSignature)
+    register_function(name, signature)
+end
+
+ffi._debug = debug -- TODO(@lune/ffi): remove debug helpers once parser populates signatures.
 
 return ffi
