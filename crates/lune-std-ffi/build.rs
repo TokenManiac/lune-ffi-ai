@@ -22,6 +22,10 @@ fn main() {
         "cargo:rerun-if-changed={}",
         native_dir.join("luneffi_loader_windows.c").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("luneffi_testbridge.c").display()
+    );
 
     let mut build = cc::Build::new();
     build.include(&native_dir);
@@ -35,6 +39,8 @@ fn main() {
         build.flag_if_supported("-fvisibility=hidden");
         build.flag_if_supported("-fno-common");
     }
+
+    build.file(native_dir.join("luneffi_testbridge.c"));
 
     build.compile("luneffi_loader");
 }
