@@ -32,6 +32,7 @@ local registry = {
 
 local modules = {
     require("./cdef_spec"),
+    require("./runtime_spec"),
 }
 
 for _, register in ipairs(modules) do

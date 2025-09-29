@@ -5,61 +5,9 @@ use cfg_if::cfg_if;
 use libffi::middle::{self, Arg, Cif, CodePtr, Type};
 use mlua::prelude::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TypeCode {
-    Void,
-    Int8,
-    UInt8,
-    Int16,
-    UInt16,
-    Int32,
-    UInt32,
-    Int64,
-    UInt64,
-    IntPtr,
-    UIntPtr,
-    Float32,
-    Float64,
-    Pointer,
-}
+use crate::types::{self, TypeCode};
 
 impl TypeCode {
-    fn from_code(code: &str) -> LuaResult<Self> {
-        match code {
-            "void" => Ok(TypeCode::Void),
-            "int8" | "sint8" => Ok(TypeCode::Int8),
-            "uint8" => Ok(TypeCode::UInt8),
-            "int16" | "sint16" => Ok(TypeCode::Int16),
-            "uint16" => Ok(TypeCode::UInt16),
-            "int32" | "sint32" | "int" => Ok(TypeCode::Int32),
-            "uint32" | "unsigned int" => Ok(TypeCode::UInt32),
-            "int64" | "sint64" | "long long" => Ok(TypeCode::Int64),
-            "uint64" | "unsigned long long" => Ok(TypeCode::UInt64),
-            "long" => {
-                if cfg!(target_pointer_width = "64") && !cfg!(target_os = "windows") {
-                    Ok(TypeCode::Int64)
-                } else {
-                    Ok(TypeCode::Int32)
-                }
-            }
-            "unsigned long" => {
-                if cfg!(target_pointer_width = "64") && !cfg!(target_os = "windows") {
-                    Ok(TypeCode::UInt64)
-                } else {
-                    Ok(TypeCode::UInt32)
-                }
-            }
-            "size_t" | "uintptr_t" => Ok(TypeCode::UIntPtr),
-            "ssize_t" | "intptr_t" | "ptrdiff_t" => Ok(TypeCode::IntPtr),
-            "float" => Ok(TypeCode::Float32),
-            "double" => Ok(TypeCode::Float64),
-            "pointer" | "void*" => Ok(TypeCode::Pointer),
-            other => Err(LuaError::runtime(format!(
-                "Unsupported primitive type code '{other}'"
-            ))),
-        }
-    }
-
     fn to_libffi_type(self) -> Type {
         match self {
             TypeCode::Void => Type::void(),
@@ -101,7 +49,7 @@ impl CType {
     fn from_lua(value: LuaValue) -> LuaResult<Self> {
         match value {
             LuaValue::String(code) => {
-                let normalized = code.to_str()?.trim().to_ascii_lowercase();
+                let normalized = types::normalize_code(code.to_str()?.as_ref());
                 let ty = TypeCode::from_code(&normalized)?;
                 Ok(Self { code: ty })
             }
@@ -109,7 +57,7 @@ impl CType {
                 let code: String = table.get("code").map_err(|_| {
                     LuaError::runtime("Type descriptor missing 'code' field".to_string())
                 })?;
-                let normalized = code.trim().to_ascii_lowercase();
+                let normalized = types::normalize_code(&code);
                 let ty = TypeCode::from_code(&normalized)?;
                 Ok(Self { code: ty })
             }
@@ -270,63 +218,20 @@ impl ArgValue {
     }
 }
 
-fn lua_value_to_i64(value: &LuaValue) -> LuaResult<i64> {
-    match value {
-        LuaValue::Integer(i) => Ok(*i),
-        LuaValue::Number(n) => {
-            if !n.is_finite() {
-                return Err(LuaError::runtime(
-                    "numeric argument must be finite".to_string(),
-                ));
-            }
-            let truncated = n.trunc();
-            if (truncated - n).abs() > f64::EPSILON {
-                return Err(LuaError::runtime(
-                    "numeric argument must be integral".to_string(),
-                ));
-            }
-            Ok(truncated as i64)
-        }
-        LuaValue::Boolean(b) => Ok(if *b { 1 } else { 0 }),
+fn extract_cdata_pointer(table: &LuaTable) -> LuaResult<Option<*mut c_void>> {
+    let marker = table.raw_get::<LuaValue>("__ffi_cdata")?;
+    if !matches!(marker, LuaValue::Boolean(true)) {
+        return Ok(None);
+    }
+
+    let ptr_value = table.raw_get::<LuaValue>("__ptr")?;
+    match ptr_value {
+        LuaValue::LightUserData(ptr) => Ok(Some(ptr.0)),
+        LuaValue::Nil => Ok(Some(std::ptr::null_mut())),
         other => Err(LuaError::runtime(format!(
-            "expected numeric value, got {other:?}"
+            "cdata object missing native pointer (found {other:?})",
         ))),
     }
-}
-
-fn lua_value_to_u64(value: &LuaValue) -> LuaResult<u64> {
-    let signed = lua_value_to_i64(value)?;
-    if signed < 0 {
-        return Err(LuaError::runtime(
-            "negative value provided for unsigned argument".to_string(),
-        ));
-    }
-    Ok(signed as u64)
-}
-
-fn clamp_signed(value: i64, bits: u32) -> LuaResult<i64> {
-    let min = -(1i64 << (bits - 1));
-    let max = (1i64 << (bits - 1)) - 1;
-    if value < min || value > max {
-        return Err(LuaError::runtime(format!(
-            "signed argument out of range for {bits}-bit integer"
-        )));
-    }
-    Ok(value)
-}
-
-fn clamp_unsigned(value: u64, bits: u32) -> LuaResult<u64> {
-    let max = if bits == 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
-    if value > max {
-        return Err(LuaError::runtime(format!(
-            "unsigned argument out of range for {bits}-bit integer"
-        )));
-    }
-    Ok(value)
 }
 
 fn convert_typed_argument(
@@ -339,37 +244,40 @@ fn convert_typed_argument(
             "void type cannot be used as a function argument".to_string(),
         )),
         TypeCode::Int8 => {
-            let v = clamp_signed(lua_value_to_i64(&value)?, 8)? as i8;
+            let v = types::clamp_signed(types::lua_value_to_i64(&value)?, 8)? as i8;
             Ok((ArgValue::Int8(v), TypeCode::Int8))
         }
         TypeCode::UInt8 => {
-            let v = clamp_unsigned(lua_value_to_u64(&value)?, 8)? as u8;
+            let v = types::clamp_unsigned(types::lua_value_to_u64(&value)?, 8)? as u8;
             Ok((ArgValue::UInt8(v), TypeCode::UInt8))
         }
         TypeCode::Int16 => {
-            let v = clamp_signed(lua_value_to_i64(&value)?, 16)? as i16;
+            let v = types::clamp_signed(types::lua_value_to_i64(&value)?, 16)? as i16;
             Ok((ArgValue::Int16(v), TypeCode::Int16))
         }
         TypeCode::UInt16 => {
-            let v = clamp_unsigned(lua_value_to_u64(&value)?, 16)? as u16;
+            let v = types::clamp_unsigned(types::lua_value_to_u64(&value)?, 16)? as u16;
             Ok((ArgValue::UInt16(v), TypeCode::UInt16))
         }
         TypeCode::Int32 => {
-            let v = clamp_signed(lua_value_to_i64(&value)?, 32)? as i32;
+            let v = types::clamp_signed(types::lua_value_to_i64(&value)?, 32)? as i32;
             Ok((ArgValue::Int32(v), TypeCode::Int32))
         }
         TypeCode::UInt32 => {
-            let v = clamp_unsigned(lua_value_to_u64(&value)?, 32)? as u32;
+            let v = types::clamp_unsigned(types::lua_value_to_u64(&value)?, 32)? as u32;
             Ok((ArgValue::UInt32(v), TypeCode::UInt32))
         }
-        TypeCode::Int64 => Ok((ArgValue::Int64(lua_value_to_i64(&value)?), TypeCode::Int64)),
+        TypeCode::Int64 => Ok((
+            ArgValue::Int64(types::lua_value_to_i64(&value)?),
+            TypeCode::Int64,
+        )),
         TypeCode::UInt64 => Ok((
-            ArgValue::UInt64(lua_value_to_u64(&value)?),
+            ArgValue::UInt64(types::lua_value_to_u64(&value)?),
             TypeCode::UInt64,
         )),
         TypeCode::IntPtr => {
             let bits = usize::BITS;
-            let value = clamp_signed(lua_value_to_i64(&value)?, bits)?;
+            let value = types::clamp_signed(types::lua_value_to_i64(&value)?, bits)?;
             if bits == 64 {
                 Ok((ArgValue::Int64(value), TypeCode::IntPtr))
             } else {
@@ -378,7 +286,7 @@ fn convert_typed_argument(
         }
         TypeCode::UIntPtr => {
             let bits = usize::BITS;
-            let value = clamp_unsigned(lua_value_to_u64(&value)?, bits)?;
+            let value = types::clamp_unsigned(types::lua_value_to_u64(&value)?, bits)?;
             if bits == 64 {
                 Ok((ArgValue::UInt64(value), TypeCode::UIntPtr))
             } else {
@@ -410,6 +318,15 @@ fn convert_typed_argument(
         TypeCode::Pointer => match value {
             LuaValue::Nil => Ok((ArgValue::Pointer(std::ptr::null_mut()), TypeCode::Pointer)),
             LuaValue::LightUserData(ptr) => Ok((ArgValue::Pointer(ptr.0), TypeCode::Pointer)),
+            LuaValue::Table(table) => {
+                if let Some(ptr) = extract_cdata_pointer(&table)? {
+                    Ok((ArgValue::Pointer(ptr), TypeCode::Pointer))
+                } else {
+                    Err(LuaError::runtime(
+                        "cannot convert table value to pointer argument".to_string(),
+                    ))
+                }
+            }
             LuaValue::Integer(i) => Ok((
                 ArgValue::Pointer(
                     usize::try_from(i)
@@ -463,6 +380,15 @@ fn convert_variadic_argument(
     match value {
         LuaValue::Nil => Ok((ArgValue::Pointer(std::ptr::null_mut()), TypeCode::Pointer)),
         LuaValue::LightUserData(ptr) => Ok((ArgValue::Pointer(ptr.0), TypeCode::Pointer)),
+        LuaValue::Table(table) => {
+            if let Some(ptr) = extract_cdata_pointer(&table)? {
+                Ok((ArgValue::Pointer(ptr), TypeCode::Pointer))
+            } else {
+                Err(LuaError::runtime(
+                    "cannot infer C type for variadic table argument".to_string(),
+                ))
+            }
+        }
         LuaValue::String(s) => {
             let owned = CString::new(s.as_bytes().as_ref())
                 .map_err(|_| LuaError::runtime("string argument contains NUL byte".to_string()))?;
@@ -478,7 +404,7 @@ fn convert_variadic_argument(
             if cfg!(target_pointer_width = "64") {
                 Ok((ArgValue::Int64(i), TypeCode::Int64))
             } else {
-                let clamped = clamp_signed(i, 32)? as i32;
+                let clamped = types::clamp_signed(i, 32)? as i32;
                 Ok((ArgValue::Int32(clamped), TypeCode::Int32))
             }
         }
