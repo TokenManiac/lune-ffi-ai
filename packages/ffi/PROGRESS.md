@@ -6,9 +6,9 @@
 - [x] `ffi.cdef` parser (typedefs, enums, structs/unions, bitfields basic) *(arrays/nested declarators still TODO)*
 - [x] `ffi.new`, `ffi.typeof`, `ffi.cast`, `ffi.string`
 - [x] `ffi.sizeof`, `ffi.alignof`, `ffi.offsetof`
-- [ ] `ffi.C`, `ffi.load`, symbol cache
-- [ ] `ffi.metatype`, `ffi.gc`
-- [ ] `ffi.abi`, `ffi.os`, `ffi.arch`
+- [x] `ffi.C`, `ffi.load`, symbol cache
+- [x] `ffi.metatype`, `ffi.gc`
+- [x] `ffi.abi`, `ffi.os`, `ffi.arch`
 - [ ] Callback trampolines (Luau → C function pointers) + GC safety
 - [ ] Error/errno handling
 - [ ] Unit & integration tests (incl. tiny C test lib built in CI)

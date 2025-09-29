@@ -21,11 +21,27 @@ if type(PRIMITIVE_LAYOUTS) ~= "table" then
     error("native.primitiveLayout must be a table", 2)
 end
 
+local PLATFORM_OS = native.platformOS
+if type(PLATFORM_OS) ~= "string" then
+    error("native.platformOS must be a string", 2)
+end
+
+local PLATFORM_ARCH = native.platformArch
+if type(PLATFORM_ARCH) ~= "string" then
+    error("native.platformArch must be a string", 2)
+end
+
+local ABI_FLAGS = native.abiInfo
+if type(ABI_FLAGS) ~= "table" then
+    error("native.abiInfo must be a table", 2)
+end
+
 type LibraryState = {
     handle: NativeHandle?,
     name: string,
     autoClose: boolean,
     symbols: { [string]: any },
+    cacheKey: string?,
 }
 
 type CTypeDescriptor = {
@@ -47,9 +63,20 @@ local registry = {
     functions = {} :: { [string]: FunctionSignature },
 }
 
+local libraryCache = setmetatable({}, { __mode = "v" }) :: { [string]: any }
+
 local function trim(value: string): string
     local stripped = value:gsub("^%s+", "")
     return stripped:gsub("%s+$", "")
+end
+
+local function warn_if_available(message: string)
+    local maybeWarn = rawget(_G, "warn")
+    if type(maybeWarn) == "function" then
+        maybeWarn(message)
+    else
+        print(message)
+    end
 end
 
 type CType = {
@@ -62,6 +89,7 @@ type CType = {
     fields: { RecordField }?,
     fieldMap: { [string]: RecordField }?,
     values: { EnumEntry }?,
+    metatype: { [string]: any }?,
 }
 
 type TypeResolveResult = CType
@@ -1146,65 +1174,109 @@ return string.format("cfunction: %s", self.__name)
 end
 
 local function create_symbol_proxy(name: string, ptr: NativeHandle)
-return setmetatable({
-__name = name,
-__ptr = ptr,
-}, symbol_mt)
+    return setmetatable({
+        __name = name,
+        __ptr = ptr,
+    }, symbol_mt)
 end
 
 local library_mt = {}
 library_mt.__index = function(self, key)
-local state: LibraryState = rawget(self, "__state")
-local method = library_mt[key]
-if method then
-return method
-end
-local cached = state.symbols[key]
-if cached then
-return cached
-end
-local handle = ensure_handle(state)
-local sym, err = native.dlsym(handle, key)
-if not sym then
-error(err or string.format("Symbol '%s' not found", key), 2)
-end
-local proxy = create_symbol_proxy(key, sym)
-state.symbols[key] = proxy
-return proxy
+    local state: LibraryState = rawget(self, "__state")
+    if not state then
+        error("missing library state", 2)
+    end
+
+    local method = library_mt[key]
+    if method then
+        return method
+    end
+
+    local cached = state.symbols[key]
+    if cached then
+        return cached
+    end
+
+    local handle = ensure_handle(state)
+    local sym, err = native.dlsym(handle, key)
+    if not sym then
+        error(err or string.format("Symbol '%s' not found", key), 2)
+    end
+    local proxy = create_symbol_proxy(key, sym)
+    state.symbols[key] = proxy
+    return proxy
 end
 
 function library_mt:close(): boolean
-local state: LibraryState = rawget(self, "__state")
-if not state.handle then
-return false
-end
-local handle = state.handle
-state.handle = nil
-state.symbols = {}
-if state.autoClose then
-native.dlclose(handle)
-return true
-end
-return false
+    local state: LibraryState = rawget(self, "__state")
+    if not state then
+        return false
+    end
+
+    local handle = state.handle
+    if not handle then
+        return false
+    end
+
+    if not state.autoClose then
+        return false
+    end
+
+    local ok, err = pcall(native.dlclose, handle)
+    if not ok then
+        error(err, 2)
+    end
+
+    state.handle = nil
+    state.symbols = {}
+    if state.cacheKey then
+        libraryCache[state.cacheKey] = nil
+    end
+    return true
 end
 
 function library_mt:__tostring()
-local state: LibraryState = rawget(self, "__state")
-if state.handle then
-return string.format("clibrary: %s", state.name)
-else
-return string.format("clibrary: %s (closed)", state.name)
-end
+    local state: LibraryState = rawget(self, "__state")
+    if state and state.handle then
+        return string.format("clibrary: %s", state.name)
+    elseif state then
+        return string.format("clibrary: %s (closed)", state.name)
+    end
+    return "clibrary: <invalid>"
 end
 
-local function wrap_library(handle: NativeHandle, name: string, autoClose: boolean)
-local state: LibraryState = {
-handle = handle,
-name = name,
-autoClose = autoClose,
-symbols = {},
-}
-return setmetatable({ __state = state }, library_mt)
+function library_mt:__gc()
+    local state: LibraryState = rawget(self, "__state")
+    if not state or not state.autoClose then
+        return
+    end
+
+    local handle = state.handle
+    if not handle then
+        return
+    end
+
+    state.handle = nil
+    state.symbols = {}
+    if state.cacheKey then
+        libraryCache[state.cacheKey] = nil
+    end
+
+    local ok, err = pcall(native.dlclose, handle)
+    if not ok then
+        warn_if_available(string.format("ffi: failed to close library '%s': %s", state.name, tostring(err)))
+    end
+end
+
+local function wrap_library(handle: NativeHandle, name: string, autoClose: boolean, cacheKey: string?)
+    local state: LibraryState = {
+        handle = handle,
+        name = name,
+        autoClose = autoClose,
+        symbols = {},
+        cacheKey = cacheKey,
+    }
+    return setmetatable({ __state = state }, library_mt)
 end
 
 local function is_cdata(value: any): boolean
@@ -1500,14 +1572,137 @@ local function unwrap_pointer(value: any): NativeHandle
 end
 
 local cdata_mt = {}
-cdata_mt.__index = cdata_mt
+
+local function get_descriptor_meta(descriptor: CType): { [string]: any }?
+    local meta = descriptor.metatype
+    if type(meta) == "table" then
+        return meta
+    end
+    return nil
+end
+
+local function get_object_meta(self): { [string]: any }?
+    local meta = rawget(self, "__meta")
+    if type(meta) == "table" then
+        return meta
+    end
+    local descriptor: CType? = rawget(self, "__ctype")
+    if descriptor then
+        local descriptorMeta = get_descriptor_meta(descriptor)
+        if descriptorMeta then
+            rawset(self, "__meta", descriptorMeta)
+            return descriptorMeta
+        end
+    end
+    return nil
+end
+
+function cdata_mt:__index(key)
+    local meta = get_object_meta(self)
+    if meta then
+        local indexer = rawget(meta, "__index")
+        if type(indexer) == "function" then
+            return indexer(self, key)
+        elseif type(indexer) == "table" then
+            local value = indexer[key]
+            if value ~= nil then
+                return value
+            end
+        end
+    end
+    return rawget(cdata_mt, key)
+end
+
+function cdata_mt:__newindex(key, value)
+    local meta = get_object_meta(self)
+    if meta then
+        local handler = rawget(meta, "__newindex")
+        if type(handler) == "function" then
+            handler(self, key, value)
+            return
+        elseif type(handler) == "table" then
+            handler[key] = value
+            return
+        end
+    end
+    rawset(self, key, value)
+end
 
 function cdata_mt:__tostring()
+    local meta = get_object_meta(self)
+    if meta then
+        local handler = rawget(meta, "__tostring")
+        if type(handler) == "function" then
+            return handler(self)
+        end
+    end
+
     local descriptor: CType? = rawget(self, "__ctype")
     local ptr: NativeHandle? = rawget(self, "__ptr")
     local name = if descriptor and descriptor.name then descriptor.name else "<unknown>"
     local pointerRepr = if ptr then tostring(ptr) else "NULL"
     return string.format("cdata<%s>:%s", name, pointerRepr)
+end
+
+function cdata_mt:__len()
+    local meta = get_object_meta(self)
+    if meta then
+        local handler = rawget(meta, "__len")
+        if type(handler) == "function" then
+            return handler(self)
+        end
+    end
+    error("length operation not defined for cdata", 2)
+end
+
+function cdata_mt:__call(...)
+    local meta = get_object_meta(self)
+    if meta then
+        local handler = rawget(meta, "__call")
+        if type(handler) == "function" then
+            return handler(self, ...)
+        end
+    end
+    error("attempt to call cdata value", 2)
+end
+
+function cdata_mt:__eq(other)
+    local meta = get_object_meta(self)
+    if meta then
+        local handler = rawget(meta, "__eq")
+        if type(handler) == "function" then
+            return handler(self, other)
+        end
+    end
+
+    if type(other) == "table" and is_cdata(other) then
+        local selfPtr = rawget(self, "__ptr")
+        local otherPtr = rawget(other, "__ptr")
+        if selfPtr ~= nil and otherPtr ~= nil then
+            return selfPtr == otherPtr
+        end
+    end
+
+    return rawequal(self, other)
+end
+
+function cdata_mt:__gc()
+    local finalizer = rawget(self, "__finalizer")
+    if type(finalizer) == "function" then
+        rawset(self, "__finalizer", nil)
+        local ok, err = pcall(finalizer, self)
+        if not ok then
+            warn_if_available(string.format("ffi: error in cdata finalizer: %s", tostring(err)))
+        end
+    end
+
+    if rawget(self, "__owned") then
+        local ptr = rawget(self, "__ptr")
+        if ptr ~= nil then
+            native.free(ptr :: NativeHandle)
+            rawset(self, "__ptr", nil)
+        end
+    end
 end
 
 local function create_cdata(descriptor: CType, pointer: NativeHandle?, owned: boolean): any
@@ -1519,6 +1714,11 @@ local function create_cdata(descriptor: CType, pointer: NativeHandle?, owned: bo
 
     if pointer then
         rawset(object, "__ptr", pointer)
+    end
+
+    local meta = get_descriptor_meta(descriptor)
+    if meta then
+        rawset(object, "__meta", meta)
     end
 
     return setmetatable(object, cdata_mt)
@@ -1558,20 +1758,47 @@ function ffi.cdef(header: string)
     end
 end
 
-function ffi.load(libnameOrPath: string?): any
-if libnameOrPath ~= nil and type(libnameOrPath) ~= "string" then
-error("ffi.load expects a string or nil", 2)
-end
-local ok, handleOrErr = pcall(native.dlopen, libnameOrPath)
-if not ok then
-error(handleOrErr, 2)
-end
-local handle = handleOrErr :: NativeHandle
-local name = libnameOrPath or "<process>"
-return wrap_library(handle, name, libnameOrPath ~= nil)
+local function create_process_library(): any
+    local ok, result = pcall(native.dlopen, nil)
+    if not ok then
+        error(result, 2)
+    end
+    return wrap_library(result :: NativeHandle, "<process>", false, nil)
 end
 
-ffi.C = wrap_library(native.dlopen(nil), "<process>", false)
+ffi.C = create_process_library()
+
+function ffi.load(libnameOrPath: string?): any
+    if libnameOrPath == nil then
+        return ffi.C
+    end
+    if type(libnameOrPath) ~= "string" then
+        error("ffi.load expects a string or nil", 2)
+    end
+
+    local trimmed = trim(libnameOrPath)
+    if trimmed == "" then
+        error("ffi.load expects a non-empty library name", 2)
+    end
+
+    local cached = libraryCache[trimmed]
+    if cached then
+        local state: LibraryState? = rawget(cached, "__state")
+        if state and state.handle then
+            return cached
+        end
+        libraryCache[trimmed] = nil
+    end
+
+    local ok, handleOrErr = pcall(native.dlopen, libnameOrPath)
+    if not ok then
+        error(handleOrErr, 2)
+    end
+    local handle = handleOrErr :: NativeHandle
+    local library = wrap_library(handle, libnameOrPath, true, trimmed)
+    libraryCache[trimmed] = library
+    return library
+end
 
 function ffi.typeof(spec: any): CType
     return resolve_ctype(spec)
@@ -1659,12 +1886,47 @@ function ffi.string(value: any, len: number?): string
     return result
 end
 
-function ffi.gc(_: any, _fn: ((any) -> ())?)
-todo("ffi.gc")
+function ffi.gc(value: any, finalizer: ((any) -> ())?)
+    local valueType = type(value)
+    if valueType == "userdata" then
+        error("TODO(@lune/ffi/gc): finalizers for lightuserdata not supported yet", 2)
+    end
+    if not is_cdata(value) then
+        error("ffi.gc expects a cdata value", 2)
+    end
+    if finalizer ~= nil and type(finalizer) ~= "function" then
+        error("ffi.gc finalizer must be a function or nil", 2)
+    end
+
+    if finalizer then
+        rawset(value, "__finalizer", finalizer)
+    else
+        rawset(value, "__finalizer", nil)
+    end
+
+    return value
 end
 
-function ffi.metatype(_: any, _methods: { [string]: any })
-todo("ffi.metatype")
+function ffi.metatype(spec: any, methods: { [string]: any })
+    if methods == nil then
+        error("ffi.metatype expects a metamethod table", 2)
+    end
+    if type(methods) ~= "table" then
+        error("ffi.metatype metamethods must be provided as a table", 2)
+    end
+
+    local descriptor = resolve_ctype(spec)
+    if descriptor.kind ~= "struct" and descriptor.kind ~= "union" and descriptor.kind ~= "pointer" then
+        error(string.format("ffi.metatype does not support type '%s' yet", descriptor.name), 2)
+    end
+
+    local copy = {}
+    for key, value in pairs(methods) do
+        copy[key] = value
+    end
+
+    descriptor.metatype = copy
+    return descriptor
 end
 
 function ffi.sizeof(spec: any): number
@@ -1711,11 +1973,29 @@ function ffi.offsetof(spec: any, field: string): number
 end
 
 function ffi.abi(...: string): boolean
-todo("ffi.abi")
+    local count = select("#", ...)
+    if count == 0 then
+        error("ffi.abi expects at least one attribute", 2)
+    end
+
+    local results = table.create(count)
+    for index = 1, count do
+        local attr = select(index, ...)
+        if type(attr) ~= "string" then
+            error("ffi.abi attribute must be a string", 2)
+        end
+        local value = ABI_FLAGS[attr]
+        if value == nil then
+            error(string.format("unknown ABI attribute '%s'", attr), 2)
+        end
+        results[index] = value == true
+    end
+
+    return table.unpack(results, 1, count)
 end
 
-ffi.os = "unknown"
-ffi.arch = "unknown"
+ffi.os = PLATFORM_OS
+ffi.arch = PLATFORM_ARCH
 
 local debug = {}
 
