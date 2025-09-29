@@ -47,10 +47,27 @@ type TypeResolveResult = CType
 local TypeRegistry = {}
 TypeRegistry.__index = TypeRegistry
 
+type RecordField = {
+    name: string,
+    ctype: CType,
+    bitWidth: number?,
+}
+
+type EnumEntry = {
+    name: string,
+    value: number?,
+}
+
 type TypeRegistryState = {
     builtins: { [string]: CType },
     named: { [string]: CType },
     pointerCache: { [CType]: CType },
+    tags: {
+        struct: { [string]: CType },
+        union: { [string]: CType },
+        enum: { [string]: CType },
+    },
+    anonymousCounter: number,
 }
 
 local QUALIFIERS = {
@@ -81,6 +98,12 @@ function TypeRegistry.new(): TypeRegistryState
         builtins = {},
         named = {},
         pointerCache = setmetatable({}, { __mode = "k" }) :: { [CType]: CType },
+        tags = {
+            struct = {},
+            union = {},
+            enum = {},
+        },
+        anonymousCounter = 0,
     }
 
     local function definePrimitive(names: { string }, code: string, size: number?, align: number?)
@@ -129,7 +152,129 @@ function TypeRegistry:defineAlias(name: string, descriptor: CType)
     self.named[name] = descriptor
 end
 
+local function make_record_name(recordKind: string, tag: string?, anonymousId: number): string
+    if tag then
+        return string.format("%s %s", recordKind, tag)
+    end
+    return string.format("%s<anonymous:%d>", recordKind, anonymousId)
+end
+
+function TypeRegistry:defineRecord(recordKind: string, tag: string?, fields: { RecordField }): CType
+    local tags = if recordKind == "union" then self.tags.union else self.tags.struct
+    local anonymousId = if not tag then self.anonymousCounter + 1 else self.anonymousCounter
+    if not tag then
+        self.anonymousCounter = anonymousId
+    end
+
+    if tag then
+        local existing = tags[tag]
+        if existing then
+            local existingFields = (existing :: any).fields :: { RecordField }
+            local matches = #existingFields == #fields
+            if matches then
+                for index = 1, #fields do
+                    local a = existingFields[index]
+                    local b = fields[index]
+                    if a.name ~= b.name or a.bitWidth ~= b.bitWidth or a.ctype ~= b.ctype then
+                        matches = false
+                        break
+                    end
+                end
+            end
+
+            if not matches then
+                error(string.format("redefinition of %s '%s' conflicts with previous declaration", recordKind, tag), 3)
+            end
+
+            return existing
+        end
+    end
+
+    local descriptor: CType & { fields: { RecordField } } = {
+        kind = recordKind,
+        name = make_record_name(recordKind, tag, anonymousId),
+        code = recordKind,
+        fields = fields,
+    }
+
+    if tag then
+        tags[tag] = descriptor
+    end
+
+    return descriptor
+end
+
+function TypeRegistry:defineEnum(tag: string?, entries: { EnumEntry }): CType
+    local anonymousId = if not tag then self.anonymousCounter + 1 else self.anonymousCounter
+    if not tag then
+        self.anonymousCounter = anonymousId
+    end
+
+    if tag then
+        local existing = self.tags.enum[tag]
+        if existing then
+            local existingEntries = (existing :: any).values :: { EnumEntry }
+            local matches = #existingEntries == #entries
+            if matches then
+                for index = 1, #entries do
+                    local a = existingEntries[index]
+                    local b = entries[index]
+                    if a.name ~= b.name or a.value ~= b.value then
+                        matches = false
+                        break
+                    end
+                end
+            end
+
+            if not matches then
+                error(string.format("redefinition of enum '%s' conflicts with previous declaration", tag), 3)
+            end
+
+            return existing
+        end
+    end
+
+    local descriptor: CType & { values: { EnumEntry } } = {
+        kind = "enum",
+        name = if tag then string.format("enum %s", tag) else string.format("enum<anonymous:%d>", anonymousId),
+        code = "enum",
+        values = entries,
+    }
+
+    if tag then
+        self.tags.enum[tag] = descriptor
+    end
+
+    return descriptor
+end
+
 function TypeRegistry:resolveBase(tokens: { string }): (TypeResolveResult?, string?)
+    if #tokens >= 2 then
+        local first = tokens[1]
+        if first == "struct" then
+            local tag = tokens[2]
+            local descriptor = self.tags.struct[tag]
+            if descriptor then
+                return descriptor
+            end
+            return nil, string.format("unknown struct '%s'", tag)
+        elseif first == "union" then
+            local tag = tokens[2]
+            local descriptor = self.tags.union[tag]
+            if descriptor then
+                return descriptor
+            end
+            return nil, string.format("unknown union '%s'", tag)
+        elseif first == "enum" then
+            local tag = tokens[2]
+            local descriptor = self.tags.enum[tag]
+            if descriptor then
+                return descriptor
+            end
+            return nil, string.format("unknown enum '%s'", tag)
+        end
+    end
+
     if #tokens == 1 then
         local alias = self.named[tokens[1]]
         if alias then
@@ -247,7 +392,7 @@ local function tokenize(statement: string): { Token }
             end
             local number = statement:sub(start, index - 1)
             table.insert(tokens, { kind = "number", value = number })
-        elseif char == '(' or char == ')' or char == ',' or char == '*' or char == '{' or char == '}' or char == '[' or char == ']' or char == ';' then
+        elseif char == '(' or char == ')' or char == ',' or char == '*' or char == '{' or char == '}' or char == '[' or char == ']' or char == ';' or char == ':' or char == '=' then
             table.insert(tokens, { kind = "symbol", value = char })
             index += 1
         else
@@ -420,6 +565,244 @@ local function resolve_type_from_tokens(rawTokens: { Token }): CType
     return descriptor
 end
 
+local function parse_record_fields(recordKind: string, fieldTokens: { { Token } }): { RecordField }
+    local fields = table.create(#fieldTokens)
+
+    local function ensure(condition: boolean, message: string)
+        if not condition then
+            error(message, 3)
+        end
+    end
+
+    for index = 1, #fieldTokens do
+        local tokens = fieldTokens[index]
+        if #tokens == 0 then
+            continue
+        end
+
+        local colonIndex: number? = nil
+        for tokenIndex = 1, #tokens do
+            if tokens[tokenIndex].value == ':' then
+                colonIndex = tokenIndex
+                break
+            end
+        end
+
+        local nameIndex: number? = nil
+        for tokenIndex = #tokens, 1, -1 do
+            local token = tokens[tokenIndex]
+            if token.kind == "identifier" then
+                nameIndex = tokenIndex
+                break
+            end
+        end
+
+        ensure(nameIndex ~= nil, string.format("TODO(@lune/ffi/cdef): anonymous fields in %s not supported", recordKind))
+
+        local resolvedNameIndex = nameIndex :: number
+        local resolvedColonIndex = colonIndex
+
+        if resolvedColonIndex then
+            ensure(resolvedColonIndex == resolvedNameIndex + 1, "bitfield width must follow the field name")
+        end
+
+        ensure(resolvedNameIndex >= 2, "record fields must specify a type")
+
+        if resolvedColonIndex then
+            ensure(resolvedColonIndex + 1 <= #tokens, "bitfield width missing value")
+            local widthToken = tokens[resolvedColonIndex + 1]
+            ensure(widthToken.kind == "number", "bitfield width must be a numeric literal")
+        end
+
+        if resolvedNameIndex < #tokens then
+            local trailing = tokens[resolvedNameIndex + 1]
+            if not resolvedColonIndex or trailing.value ~= ':' then
+                error("TODO(@lune/ffi/cdef): array and declarator modifiers in records not yet supported", 3)
+            end
+        end
+
+        local typeSlice = table.create(resolvedNameIndex - 1)
+        for tokenIndex = 1, resolvedNameIndex - 1 do
+            typeSlice[tokenIndex] = tokens[tokenIndex]
+        end
+
+        local descriptor = resolve_type_from_tokens(typeSlice)
+
+        local bitWidth: number? = nil
+        if resolvedColonIndex then
+            bitWidth = tonumber(tokens[resolvedColonIndex + 1].value)
+        end
+
+        table.insert(fields, {
+            name = tokens[resolvedNameIndex].value,
+            ctype = descriptor,
+            bitWidth = bitWidth,
+        })
+    end
+
+    return fields
+end
+
+local function partition_record_tokens(tokens: { Token }): { { Token } }
+    local segments = {}
+    local buffer = {}
+
+    for index = 1, #tokens do
+        local token = tokens[index]
+        if token.value == ';' then
+            local entry = table.create(#buffer)
+            for n = 1, #buffer do
+                entry[n] = buffer[n]
+            end
+            table.insert(segments, entry)
+            table.clear(buffer)
+        else
+            if token.value == '{' or token.value == '}' then
+                error("TODO(@lune/ffi/cdef): nested records within structs/unions not supported yet", 3)
+            end
+            table.insert(buffer, token)
+        end
+    end
+
+    if #buffer > 0 then
+        table.insert(segments, buffer)
+    end
+
+    return segments
+end
+
+local function parse_record_definition(recordKind: string, tokens: { Token }): CType
+    local index = 2
+    local tag: string? = nil
+
+    if tokens[index] and tokens[index].kind == "identifier" then
+        tag = tokens[index].value
+        index += 1
+    end
+
+    if not tokens[index] or tokens[index].value ~= '{' then
+        error(string.format("TODO(@lune/ffi/cdef): forward declarations of %s not supported", recordKind), 3)
+    end
+
+    index += 1
+
+    local body = {}
+    while index <= #tokens and tokens[index].value ~= '}' do
+        table.insert(body, tokens[index])
+        index += 1
+    end
+
+    if index > #tokens or tokens[index].value ~= '}' then
+        error(string.format("unterminated %s definition", recordKind), 3)
+    end
+
+    if index ~= #tokens then
+        error(string.format("unexpected tokens after %s definition", recordKind), 3)
+    end
+
+    local fieldGroups = partition_record_tokens(body)
+    local fields = parse_record_fields(recordKind, fieldGroups)
+
+    return typeRegistry:defineRecord(recordKind, tag, fields)
+end
+
+local function parse_enum_definition(tokens: { Token }): CType
+    local index = 2
+    local tag: string? = nil
+
+    if tokens[index] and tokens[index].kind == "identifier" then
+        tag = tokens[index].value
+        index += 1
+    end
+
+    if not tokens[index] or tokens[index].value ~= '{' then
+        error("TODO(@lune/ffi/cdef): forward declarations of enums not supported", 3)
+    end
+
+    index += 1
+
+    local entries: { EnumEntry } = {}
+    local expectEntry = true
+    local lastValue: number? = nil
+
+    while index <= #tokens do
+        local token = tokens[index]
+        if token.value == '}' then
+            break
+        end
+
+        if token.value == ',' then
+            expectEntry = true
+            index += 1
+            continue
+        end
+
+        if not expectEntry then
+            error("unexpected token in enum body", 3)
+        end
+
+        if token.kind ~= "identifier" then
+            error("enum entry name must be an identifier", 3)
+        end
+
+        local name = token.value
+        index += 1
+
+        local value: number? = nil
+        if index <= #tokens and tokens[index].value == '=' then
+            index += 1
+            local literal = tokens[index]
+            if not literal or literal.kind ~= "number" then
+                error("TODO(@lune/ffi/cdef): complex enum expressions not supported", 3)
+            end
+            value = tonumber(literal.value)
+            index += 1
+        elseif lastValue then
+            value = lastValue + 1
+        else
+            value = 0
+        end
+
+        lastValue = value
+        table.insert(entries, { name = name, value = value })
+        expectEntry = false
+    end
+
+    if index > #tokens or tokens[index].value ~= '}' then
+        error("unterminated enum definition", 3)
+    end
+
+    if index ~= #tokens then
+        error("unexpected tokens after enum definition", 3)
+    end
+
+    return typeRegistry:defineEnum(tag, entries)
+end
+
+local function contains_symbol(tokens: { Token }, symbol: string): boolean
+    for index = 1, #tokens do
+        if tokens[index].value == symbol then
+            return true
+        end
+    end
+    return false
+end
+
+local function parse_type_specifier(tokens: { Token }): CType
+    if #tokens == 0 then
+        error("missing type specifier", 3)
+    end
+
+    local first = tokens[1].value
+    if (first == "struct" or first == "union") and contains_symbol(tokens, '{') then
+        return parse_record_definition(first, tokens)
+    elseif first == "enum" and contains_symbol(tokens, '{') then
+        return parse_enum_definition(tokens)
+    end
+
+    return resolve_type_from_tokens(tokens)
+end
+
 local function parse_function(statement: string)
     local tokens = tokenize(statement)
     local openIndex = nil
@@ -557,13 +940,6 @@ local function parse_typedef(statement: string)
         error("typedef missing target type", 3)
     end
 
-    for index = 1, #body do
-        local value = body[index].value
-        if value == '{' or value == '}' then
-            error("TODO(@lune/ffi/cdef): struct/union typedef parsing not implemented", 3)
-        end
-    end
-
     local aliasToken = body[#body]
     if aliasToken.kind ~= "identifier" then
         error("typedef target name must be an identifier", 3)
@@ -581,7 +957,13 @@ local function parse_typedef(statement: string)
 
     local descriptor
     local ok, message = pcall(function()
-        descriptor = resolve_type_from_tokens(typeTokens)
+        for index = 1, #typeTokens do
+            if typeTokens[index].value == '(' then
+                error("TODO(@lune/ffi/cdef): function pointer typedefs not implemented", 3)
+            end
+        end
+
+        descriptor = parse_type_specifier(typeTokens)
     end)
 
     if not ok then
@@ -600,6 +982,18 @@ end
 local function parse_declaration(statement: string)
     if statement:match("^typedef") then
         return parse_typedef(statement)
+    end
+
+    local tokens = tokenize(statement)
+    if #tokens > 0 then
+        local first = tokens[1].value
+        if first == "struct" or first == "union" then
+            local descriptor = parse_type_specifier(tokens)
+            return { kind = first, type = descriptor }
+        elseif first == "enum" then
+            local descriptor = parse_type_specifier(tokens)
+            return { kind = "enum", type = descriptor }
+        end
     end
 
     if statement:find('(', 1, true) then
@@ -798,6 +1192,8 @@ function ffi.cdef(header: string)
             })
         elseif declaration.kind == "typedef" then
             -- nothing further: typedefs already registered inside parser
+        elseif declaration.kind == "struct" or declaration.kind == "union" or declaration.kind == "enum" then
+            -- definitions already recorded in the registry via parse_type_specifier
         else
             error(string.format("TODO(@lune/ffi/cdef): declaration kind '%s' not supported", tostring(declaration.kind)), 2)
         end
