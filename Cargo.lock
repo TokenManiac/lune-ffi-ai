@@ -1721,6 +1721,7 @@ version = "0.3.2"
 dependencies = [
  "cc",
  "cfg-if 1.0.3",
+ "libc",
  "libffi",
  "lune-utils",
  "mlua",

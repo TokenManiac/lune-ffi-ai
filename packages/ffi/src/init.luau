@@ -1,6 +1,25 @@
 local native = select(1, ...)
 
+if type(native) ~= "table" then
+    error("native bindings table is required", 2)
+end
+
 export type NativeHandle = lightuserdata
+
+local POINTER_SIZE = native.pointerSize
+if type(POINTER_SIZE) ~= "number" then
+    error("native.pointerSize must be a number", 2)
+end
+
+local POINTER_ALIGN = native.pointerAlign
+if type(POINTER_ALIGN) ~= "number" then
+    error("native.pointerAlign must be a number", 2)
+end
+
+local PRIMITIVE_LAYOUTS = native.primitiveLayout
+if type(PRIMITIVE_LAYOUTS) ~= "table" then
+    error("native.primitiveLayout must be a table", 2)
+end
 
 type LibraryState = {
     handle: NativeHandle?,
@@ -90,9 +109,6 @@ local function createPrimitive(name: string, code: string, size: number?, align:
     }
 end
 
-local POINTER_SIZE: number? = nil -- TODO(@lune/ffi/types): detect pointer size when implementing sizeof.
-local POINTER_ALIGN: number? = nil -- TODO(@lune/ffi/types): detect pointer alignment when implementing sizeof.
-
 function TypeRegistry.new(): TypeRegistryState
     local state: TypeRegistryState = {
         builtins = {},
@@ -107,6 +123,23 @@ function TypeRegistry.new(): TypeRegistryState
     }
 
     local function definePrimitive(names: { string }, code: string, size: number?, align: number?)
+        local layout = PRIMITIVE_LAYOUTS[code]
+        if size == nil then
+            if layout and type(layout.size) == "number" then
+                size = layout.size
+            else
+                error(string.format("missing size information for primitive '%s'", code), 2)
+            end
+        end
+
+        if align == nil then
+            if layout and type(layout.align) == "number" then
+                align = layout.align
+            else
+                error(string.format("missing alignment information for primitive '%s'", code), 2)
+            end
+        end
+
         local descriptor = createPrimitive(names[1], code, size, align)
         for _, entry in ipairs(names) do
             state.builtins[entry:lower()] = descriptor
@@ -1166,6 +1199,152 @@ symbols = {},
 return setmetatable({ __state = state }, library_mt)
 end
 
+local function is_cdata(value: any): boolean
+    return type(value) == "table" and rawget(value, "__ffi_cdata") == true
+end
+
+local function resolve_ctype(value: any): CType
+    local valueType = type(value)
+    if valueType == "string" then
+        local tokens = tokenize(value)
+        return resolve_type_from_tokens(tokens)
+    elseif valueType == "table" then
+        if is_cdata(value) then
+            local descriptor = rawget(value, "__ctype")
+            if descriptor then
+                return descriptor
+            end
+        end
+
+        if value.kind and value.code then
+            return value :: CType
+        end
+    end
+
+    error("invalid ctype specification", 3)
+end
+
+local function get_type_size(descriptor: CType): number
+    if type(descriptor.size) == "number" then
+        return descriptor.size
+    end
+    error(string.format("TODO(@lune/ffi/types): sizeof for type '%s' not implemented", descriptor.name), 3)
+end
+
+local function get_type_align(descriptor: CType): number
+    if type(descriptor.align) == "number" then
+        return descriptor.align
+    end
+    error(string.format("TODO(@lune/ffi/types): alignof for type '%s' not implemented", descriptor.name), 3)
+end
+
+local function with_pointer_scratch(callback: (NativeHandle) -> any)
+    local scratch = native.alloc(POINTER_SIZE)
+    local ok, result = pcall(callback, scratch)
+    native.free(scratch)
+    if ok then
+        return result
+    end
+    error(result, 3)
+end
+
+local function convert_scalar_to_pointer(value: any): NativeHandle?
+    return with_pointer_scratch(function(scratch)
+        local ok, err = pcall(native.storeScalar, scratch, "pointer", value)
+        if not ok then
+            error(err, 3)
+        end
+
+        local okLoad, loaded = pcall(native.loadScalar, scratch, "pointer")
+        if not okLoad then
+            error(loaded, 3)
+        end
+
+        if loaded == nil then
+            return nil
+        end
+
+        if type(loaded) ~= "userdata" then
+            error("native.loadScalar returned unexpected value for pointer", 3)
+        end
+
+        return loaded :: NativeHandle
+    end)
+end
+
+local function coerce_pointer_value(value: any): NativeHandle?
+    local valueType = type(value)
+    if value == nil then
+        return nil
+    elseif valueType == "userdata" then
+        return value :: NativeHandle
+    elseif valueType == "table" and is_cdata(value) then
+        local ptr = rawget(value, "__ptr")
+        if ptr == nil then
+            return nil
+        end
+        return ptr :: NativeHandle
+    elseif valueType == "number" then
+        if value ~= value or value == math.huge or value == -math.huge then
+            error("pointer value must be finite", 3)
+        end
+        if value < 0 then
+            error("pointer value must be non-negative", 3)
+        end
+        if value % 1 ~= 0 then
+            error("pointer value must be integral", 3)
+        end
+        return convert_scalar_to_pointer(value)
+    elseif valueType == "boolean" then
+        if value then
+            error("cannot convert boolean 'true' to pointer", 3)
+        end
+        return nil
+    else
+        error("cannot convert value to pointer", 3)
+    end
+end
+
+local function unwrap_pointer(value: any): NativeHandle
+    local valueType = type(value)
+    if valueType == "userdata" then
+        return value :: NativeHandle
+    elseif valueType == "table" and is_cdata(value) then
+        local ptr = rawget(value, "__ptr")
+        if ptr == nil then
+            error("cdata has null pointer", 3)
+        end
+        return ptr :: NativeHandle
+    end
+
+    error("expected cdata or lightuserdata", 3)
+end
+
+local cdata_mt = {}
+cdata_mt.__index = cdata_mt
+
+function cdata_mt:__tostring()
+    local descriptor: CType? = rawget(self, "__ctype")
+    local ptr: NativeHandle? = rawget(self, "__ptr")
+    local name = if descriptor and descriptor.name then descriptor.name else "<unknown>"
+    local pointerRepr = if ptr then tostring(ptr) else "NULL"
+    return string.format("cdata<%s>:%s", name, pointerRepr)
+end
+
+local function create_cdata(descriptor: CType, pointer: NativeHandle?, owned: boolean): any
+    local object = {
+        __ffi_cdata = true,
+        __ctype = descriptor,
+        __owned = owned,
+    }
+
+    if pointer then
+        rawset(object, "__ptr", pointer)
+    end
+
+    return setmetatable(object, cdata_mt)
+end
+
 local ffi = {}
 
 function ffi.cdef(header: string)
@@ -1215,20 +1394,90 @@ end
 
 ffi.C = wrap_library(native.dlopen(nil), "<process>", false)
 
-function ffi.new(_: any, ...): any
-todo("ffi.new")
+function ffi.typeof(spec: any): CType
+    return resolve_ctype(spec)
 end
 
-function ffi.typeof(_: any): any
-todo("ffi.typeof")
+local function allocate_primitive(descriptor: CType, init: any?): any
+    local size = get_type_size(descriptor)
+    local ptr = native.alloc(size)
+
+    local ok, err = pcall(function()
+        if init ~= nil then
+            native.storeScalar(ptr, descriptor.code, init)
+        end
+    end)
+
+    if not ok then
+        native.free(ptr)
+        error(err, 3)
+    end
+
+    return create_cdata(descriptor, ptr, true)
 end
 
-function ffi.cast(_: any, _value: any): any
-todo("ffi.cast")
+function ffi.new(spec: any, ...): any
+    local descriptor = resolve_ctype(spec)
+
+    if descriptor.kind == "primitive" then
+        local init = if select("#", ...) >= 1 then select(1, ...) else nil
+        return allocate_primitive(descriptor, init)
+    elseif descriptor.kind == "pointer" then
+        local pointerValue: NativeHandle? = nil
+        if select("#", ...) >= 1 then
+            pointerValue = coerce_pointer_value(select(1, ...))
+        end
+        return create_cdata(descriptor, pointerValue, false)
+    end
+
+    error(string.format("TODO(@lune/ffi/new): allocation for type '%s' not implemented", descriptor.name), 2)
 end
 
-function ffi.string(_: any, _len: number?): string
-todo("ffi.string")
+function ffi.cast(spec: any, value: any): any
+    local descriptor = resolve_ctype(spec)
+
+    if descriptor.kind == "pointer" then
+        local pointerValue = coerce_pointer_value(value)
+        return create_cdata(descriptor, pointerValue, false)
+    elseif descriptor.kind == "primitive" then
+        return allocate_primitive(descriptor, value)
+    end
+
+    error(string.format("TODO(@lune/ffi/cast): casting to type '%s' not implemented", descriptor.name), 2)
+end
+
+function ffi.string(value: any, len: number?): string
+    local pointer: NativeHandle
+    local valueType = type(value)
+    if valueType == "userdata" then
+        pointer = value :: NativeHandle
+    elseif valueType == "table" and is_cdata(value) then
+        local ptr = rawget(value, "__ptr")
+        if ptr == nil then
+            error("ffi.string expects a non-null pointer", 2)
+        end
+        pointer = ptr :: NativeHandle
+    else
+        error("ffi.string expects cdata or lightuserdata", 2)
+    end
+
+    local lengthArg: number? = nil
+    if len ~= nil then
+        if type(len) ~= "number" then
+            error("ffi.string length must be a number", 2)
+        end
+        if len < 0 then
+            error("ffi.string length must be non-negative", 2)
+        end
+        lengthArg = math.floor(len + 0.0)
+    end
+
+    local ok, result = pcall(native.readString, pointer, lengthArg)
+    if not ok then
+        error(result, 2)
+    end
+
+    return result
 end
 
 function ffi.gc(_: any, _fn: ((any) -> ())?)
@@ -1308,6 +1557,66 @@ end
 
 function debug.getFunctionSignature(name: string): FunctionSignature?
     return get_function_signature(name)
+end
+
+function debug.readScalar(object: any): any
+    if not is_cdata(object) then
+        error("debug.readScalar expects cdata", 2)
+    end
+
+    local descriptor = resolve_ctype(object)
+    if descriptor.kind == "primitive" then
+        local ptr = unwrap_pointer(object)
+        local ok, result = pcall(native.loadScalar, ptr, descriptor.code)
+        if not ok then
+            error(result, 2)
+        end
+        return result
+    elseif descriptor.kind == "pointer" then
+        return rawget(object, "__ptr")
+    end
+
+    error("debug.readScalar only supports primitive and pointer types", 2)
+end
+
+function debug.writeBytes(target: any, data: string, appendNull: boolean?)
+    local pointer: NativeHandle
+    if is_cdata(target) then
+        pointer = unwrap_pointer(target)
+    elseif type(target) == "userdata" then
+        pointer = target :: NativeHandle
+    else
+        error("debug.writeBytes expects cdata or lightuserdata", 2)
+    end
+
+    local ok, err = pcall(native.writeBytes, pointer, data, appendNull == true)
+    if not ok then
+        error(err, 2)
+    end
+end
+
+function debug.alloc(size: number): NativeHandle
+    if type(size) ~= "number" then
+        error("debug.alloc expects numeric size", 2)
+    end
+    if size < 0 then
+        error("debug.alloc size must be non-negative", 2)
+    end
+    local ok, result = pcall(native.alloc, math.floor(size + 0.0))
+    if not ok then
+        error(result, 2)
+    end
+    return result
+end
+
+function debug.free(ptr: any)
+    if ptr == nil then
+        return
+    end
+    if type(ptr) ~= "userdata" then
+        error("debug.free expects lightuserdata", 2)
+    end
+    native.free(ptr :: NativeHandle)
 end
 
 ffi._debug = debug -- TODO(@lune/ffi): remove debug helpers once parser populates signatures.

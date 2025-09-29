@@ -4,6 +4,7 @@ use mlua::prelude::*;
 
 mod call;
 mod native;
+mod types;
 
 const MODULE_SOURCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
