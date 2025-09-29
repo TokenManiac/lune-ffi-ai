@@ -100,4 +100,94 @@ return function(ctx)
         assert(type(missingErr) == "string", "expected error when field missing")
         assert(missingErr:find("field 'missing' not found", 1, true) ~= nil)
     end)
+
+    test("ffi.C resolves process symbols and ffi.load returns the default library", function()
+        local defaultLib = ffi.load(nil)
+        assertEqual(defaultLib, ffi.C)
+
+        local repr = tostring(defaultLib)
+        assert(type(repr) == "string" and repr:find("clibrary:", 1, true) == 1)
+
+        local ok, err = pcall(function()
+            return defaultLib.__definitely_missing_symbol
+        end)
+        assertEqual(ok, false)
+        assert(type(err) == "string")
+        assert(
+            err:find("Symbol", 1, true) ~= nil
+                or err:find("symbol", 1, true) ~= nil,
+            "expected lookup failure to mention missing symbol"
+        )
+    end)
+
+    test("ffi.gc attaches and triggers finalizers exactly once", function()
+        local finalizeCount = 0
+        do
+            local value = ffi.new("int", 64)
+            ffi.gc(value, function(obj)
+                finalizeCount += 1
+                assertEqual(ffi.typeof(obj).code, "int")
+            end)
+
+            local mt = getmetatable(value)
+            assert(type(mt) == "table" and type(mt.__gc) == "function")
+            mt.__gc(value)
+        end
+
+        assertEqual(finalizeCount, 1)
+
+        do
+            local value = ffi.new("int", 7)
+            ffi.gc(value, function()
+                finalizeCount += 10
+            end)
+            ffi.gc(value, nil)
+
+            local mt = getmetatable(value)
+            assert(type(mt) == "table" and type(mt.__gc) == "function")
+            mt.__gc(value)
+        end
+
+        assertEqual(finalizeCount, 1)
+    end)
+
+    test("ffi.metatype customizes pointer behaviour", function()
+        local intPointer = ffi.typeof("int*")
+        ffi.metatype(intPointer, {
+            __tostring = function(self)
+                local ptr = rawget(self, "__ptr")
+                if ptr == nil then
+                    return "int*<null>"
+                end
+                return "int*" .. tostring(ptr)
+            end,
+        })
+
+        local nullPtr = ffi.new("int*")
+        assertEqual(tostring(nullPtr), "int*<null>")
+
+        local value = ffi.new("int", 9)
+        local alias = ffi.cast(intPointer, value)
+        local representation = tostring(alias)
+        assert(type(representation) == "string", "metatype tostring should return a string")
+        assert(representation:find("int*", 1, true) ~= nil, "custom tostring should include prefix")
+    end)
+
+    test("ffi.abi exposes platform information", function()
+        local is32, is64 = ffi.abi("32bit"), ffi.abi("64bit")
+        assert(is32 ~= is64, "exactly one of 32bit/64bit must be true")
+
+        local le, be = ffi.abi("le", "be")
+        assert(le ~= be, "endianness flags must be mutually exclusive")
+
+        assert(type(ffi.os) == "string" and #ffi.os > 0, "ffi.os must be a non-empty string")
+        assert(type(ffi.arch) == "string" and #ffi.arch > 0, "ffi.arch must be a non-empty string")
+
+        local ok, err = pcall(function()
+            ffi.abi("not-a-real-flag")
+        end)
+        assertEqual(ok, false)
+        assert(type(err) == "string")
+        assert(err:find("unknown ABI attribute", 1, true) ~= nil)
+    end)
 end

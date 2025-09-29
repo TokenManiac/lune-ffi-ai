@@ -27,6 +27,105 @@ fn last_error() -> Option<String> {
     Some(c_str.to_string_lossy().into_owned())
 }
 
+fn detect_os() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "OSX"
+    } else if cfg!(target_os = "ios") {
+        "iOS"
+    } else if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+        "Linux"
+    } else if cfg!(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    )) {
+        "BSD"
+    } else if cfg!(target_os = "solaris") {
+        "Solaris"
+    } else {
+        "Other"
+    }
+}
+
+fn detect_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else if cfg!(target_arch = "x86") {
+        "x86"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "arm") {
+        "arm"
+    } else if cfg!(target_arch = "powerpc64") {
+        "ppc64"
+    } else if cfg!(target_arch = "powerpc") {
+        "ppc"
+    } else if cfg!(target_arch = "mips64") {
+        "mips64"
+    } else if cfg!(target_arch = "mips") {
+        "mips"
+    } else if cfg!(target_arch = "riscv64") {
+        "riscv64"
+    } else if cfg!(target_arch = "s390x") {
+        "s390x"
+    } else {
+        "other"
+    }
+}
+
+fn build_abi_info(lua: &Lua) -> LuaResult<LuaTable> {
+    let table = lua.create_table()?;
+
+    table.set("32bit", cfg!(target_pointer_width = "32"))?;
+    table.set("64bit", cfg!(target_pointer_width = "64"))?;
+    table.set("le", cfg!(target_endian = "little"))?;
+    table.set("be", cfg!(target_endian = "big"))?;
+
+    let hardfp = cfg!(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+    ));
+    let softfp = cfg!(target_arch = "arm");
+    let fpu = hardfp || softfp;
+
+    table.set("fpu", fpu)?;
+    table.set("softfp", softfp)?;
+    table.set("hardfp", hardfp)?;
+    table.set("win", cfg!(target_os = "windows"))?;
+    table.set(
+        "bsd",
+        cfg!(any(
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+        )),
+    )?;
+    table.set(
+        "elf",
+        cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+        )),
+    )?;
+
+    Ok(table)
+}
+
 fn build_primitive_layout(lua: &Lua) -> LuaResult<LuaTable> {
     let layout = lua.create_table()?;
     const CODES: &[&str] = &[
@@ -310,6 +409,15 @@ pub fn create(lua: &Lua) -> LuaResult<LuaTable> {
 
     let primitive_layout = build_primitive_layout(lua)?;
     table.set("primitiveLayout", primitive_layout)?;
+
+    let os_string = lua.create_string(detect_os())?;
+    table.set("platformOS", os_string)?;
+
+    let arch_string = lua.create_string(detect_arch())?;
+    table.set("platformArch", arch_string)?;
+
+    let abi_info = build_abi_info(lua)?;
+    table.set("abiInfo", abi_info)?;
 
     let dlopen_fn = lua.create_function(|_, path: Option<String>| {
         let c_path =
