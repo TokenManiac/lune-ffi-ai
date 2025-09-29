@@ -198,6 +198,14 @@ int luneffi_test_call_callback(RuntimeUnary cb, int value);]])
         assertEqual(total, 7)
     end)
 
+    test("ffi.errno exposes native errno and allows overriding", function()
+        local original = ffi.errno()
+        local marker = 1337
+        ffi.errno(marker)
+        assertEqual(ffi.errno(), marker)
+        ffi.errno(original)
+    end)
+
     test("ffi.abi exposes platform information", function()
         local is32, is64 = ffi.abi("32bit"), ffi.abi("64bit")
         assert(is32 ~= is64, "exactly one of 32bit/64bit must be true")

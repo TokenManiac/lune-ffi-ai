@@ -1,3 +1,8 @@
--- TODO(@lune/ffi/examples): replace with working example once ffi implementation is ready.
 local ffi = require("@lune/ffi")
-print("ffi placeholder", ffi)
+
+ffi.cdef([[int puts(const char*);]])
+
+local message = "Hello from @lune/ffi!"
+local written = ffi.C.puts(message)
+print("puts returned", written)
+print("errno", ffi.errno())
