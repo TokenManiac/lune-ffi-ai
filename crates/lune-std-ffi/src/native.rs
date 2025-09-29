@@ -23,6 +23,87 @@ static LUNEFFI_KEEP_TEST_CALLBACK: unsafe extern "C" fn(Option<TestCallback>, c_
 
 use libc::{calloc, free, memcpy, size_t};
 
+cfg_if::cfg_if! {
+    if #[cfg(any(
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "android",
+        target_os = "cygwin",
+    ))] {
+        #[inline]
+        fn errno_location() -> *mut c_int {
+            unsafe { libc::__errno() }
+        }
+    } else if #[cfg(any(
+        target_os = "linux",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "redox",
+        target_os = "dragonfly",
+    ))] {
+        #[inline]
+        fn errno_location() -> *mut c_int {
+            unsafe { libc::__errno_location() }
+        }
+    } else if #[cfg(any(target_os = "solaris", target_os = "illumos"))] {
+        #[inline]
+        fn errno_location() -> *mut c_int {
+            unsafe { libc::___errno() }
+        }
+    } else if #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))] {
+        #[inline]
+        fn errno_location() -> *mut c_int {
+            unsafe { libc::__error() }
+        }
+    } else if #[cfg(target_os = "haiku")] {
+        #[inline]
+        fn errno_location() -> *mut c_int {
+            unsafe { libc::_errnop() }
+        }
+    } else if #[cfg(target_os = "nto")] {
+        #[inline]
+        fn errno_location() -> *mut c_int {
+            unsafe { libc::__get_errno_ptr() }
+        }
+    } else if #[cfg(any(
+        all(target_os = "horizon", target_arch = "arm"),
+        target_os = "vita",
+    ))] {
+        extern "C" {
+            fn __errno() -> *mut c_int;
+        }
+
+        #[inline]
+        fn errno_location() -> *mut c_int {
+            unsafe { __errno() }
+        }
+    } else if #[cfg(target_os = "aix")] {
+        #[inline]
+        fn errno_location() -> *mut c_int {
+            unsafe { libc::_Errno() }
+        }
+    } else if #[cfg(windows)] {
+        #[inline]
+        fn errno_location() -> *mut c_int {
+            unsafe { libc::_errno() }
+        }
+    } else {
+        compile_error!("Unsupported platform: no errno accessor available for lune-std-ffi");
+    }
+}
+
+#[inline]
+fn get_errno() -> c_int {
+    unsafe { *errno_location() }
+}
+
+#[inline]
+fn set_errno(value: c_int) {
+    unsafe {
+        *errno_location() = value;
+    }
+}
+
 #[allow(improper_ctypes)]
 unsafe extern "C" {
     fn luneffi_dlopen(path: *const c_char) -> *mut c_void;
@@ -477,6 +558,21 @@ pub fn create(lua: &Lua) -> LuaResult<LuaTable> {
         Ok(())
     })?;
     table.set("dlclose", dlclose_fn)?;
+
+    let errno_get_fn = lua.create_function(|_, ()| {
+        Ok(i64::from(get_errno()))
+    })?;
+    table.set("getErrno", errno_get_fn)?;
+
+    let errno_set_fn = lua.create_function(|_, value: LuaValue| {
+        let coerced = types::lua_value_to_i64(&value)?;
+        if coerced < c_int::MIN as i64 || coerced > c_int::MAX as i64 {
+            return Err(LuaError::runtime("errno value out of range for C int".to_string()));
+        }
+        set_errno(coerced as c_int);
+        Ok(())
+    })?;
+    table.set("setErrno", errno_set_fn)?;
 
     let alloc_fn = lua.create_function(|_, size: u64| {
         let bytes = usize::try_from(size)

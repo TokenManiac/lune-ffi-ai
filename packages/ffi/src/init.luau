@@ -2272,6 +2272,22 @@ function ffi.alignof(spec: any): number
     return get_type_align(descriptor)
 end
 
+function ffi.errno(value: any?): number
+    if value ~= nil then
+        local ok, err = pcall(native.setErrno, value)
+        if not ok then
+            error(err, 2)
+        end
+    end
+
+    local ok, result = pcall(native.getErrno)
+    if not ok then
+        error(result, 2)
+    end
+
+    return result
+end
+
 function ffi.offsetof(spec: any, field: string): number
     if type(field) ~= "string" then
         error("ffi.offsetof expects field name string", 2)

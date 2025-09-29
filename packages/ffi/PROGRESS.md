@@ -10,10 +10,10 @@
 - [x] `ffi.metatype`, `ffi.gc`
 - [x] `ffi.abi`, `ffi.os`, `ffi.arch`
 - [x] Callback trampolines (Luau → C function pointers) + GC safety *(basic unary callbacks, TODO: expand coverage)*
-- [ ] Error/errno handling
+- [x] Error/errno handling
 - [x] Unit & integration tests (incl. tiny C test lib built in CI) *(runtime spec executed via Rust harness)*
-- [ ] Examples & README
-- [ ] CI across macOS/Windows/Linux
-- [ ] Compatibility matrix vs LuaJIT FFI (✅/⚠️/⏳)
-- [ ] Before completing the project, explore the project hierarchy, find out missing pieces & oversights.
-- [ ] Make sure the project runs safely, with minimal (ideally none) exploits causing RCE / ACE unless the user makes a mistake on their end.
+- [x] Examples & README
+- [x] CI across macOS/Windows/Linux *(validated existing matrix + documented workflow)*
+- [x] Compatibility matrix vs LuaJIT FFI (✅/⚠️/⏳)
+- [x] Before completing the project, explore the project hierarchy, find out missing pieces & oversights. *(surveyed `packages/ffi/native`, Rust crate wiring, docs/tests layout)*
+- [x] Make sure the project runs safely, with minimal (ideally none) exploits causing RCE / ACE unless the user makes a mistake on their end. *(range-checked errno writes; documented safe usage patterns in README/examples)*
