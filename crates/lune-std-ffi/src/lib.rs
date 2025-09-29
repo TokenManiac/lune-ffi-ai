@@ -3,7 +3,9 @@
 use mlua::prelude::*;
 
 mod call;
+mod callback;
 mod native;
+mod signature;
 mod types;
 
 const MODULE_SOURCE: &str = include_str!(concat!(

@@ -43,4 +43,8 @@ fn main() {
     build.file(native_dir.join("luneffi_testbridge.c"));
 
     build.compile("luneffi_loader");
+
+    if cfg!(not(target_os = "windows")) {
+        println!("cargo:rustc-link-arg=-Wl,--export-dynamic");
+    }
 }
