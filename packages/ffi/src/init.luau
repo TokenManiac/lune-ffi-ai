@@ -1,5 +1,22 @@
 local native = select(1, ...)
 
+local taskLibrary: any
+
+local function ensure_task_library()
+    local existing = taskLibrary
+    if existing then
+        return existing
+    end
+
+    local globalTask = rawget(_G, "task")
+    if type(globalTask) ~= "table" then
+        error("task library is required to manage ffi finalizers", 2)
+    end
+
+    taskLibrary = globalTask
+    return globalTask
+end
+
 if type(native) ~= "table" then
     error("native bindings table is required", 2)
 end
@@ -42,6 +59,7 @@ type LibraryState = {
     autoClose: boolean,
     symbols: { [string]: any },
     cacheKey: string?,
+    finalizerIndex: number?,
 }
 
 type CTypeDescriptor = {
@@ -64,6 +82,100 @@ local registry = {
 }
 
 local libraryCache = setmetatable({}, { __mode = "v" }) :: { [string]: any }
+
+local FINALIZER_POLL_INTERVAL = 3
+
+local finalizerRefs = setmetatable({}, { __mode = "v" }) :: { [number]: any }
+local finalizerStates = {} :: { [number]: LibraryState }
+local finalizerFreeSlots = {} :: { [number]: number }
+local finalizerMaxIndex = 0
+local finalizerLoopActive = false
+
+local function clear_library_state(state: LibraryState)
+    state.handle = nil
+    state.symbols = {}
+    if state.cacheKey then
+        libraryCache[state.cacheKey] = nil
+    end
+end
+
+local function release_finalizer_slot(index: number)
+    finalizerRefs[index] = nil
+    finalizerStates[index] = nil
+    table.insert(finalizerFreeSlots, index)
+end
+
+local function ensure_finalizer_loop()
+    if finalizerLoopActive then
+        return
+    end
+
+    finalizerLoopActive = true
+
+    local scheduler = ensure_task_library()
+    local defer = scheduler.defer
+    local wait = scheduler.wait
+    if type(defer) ~= "function" or type(wait) ~= "function" then
+        error("task library missing defer/wait implementations", 2)
+    end
+
+    defer(function()
+        while true do
+            wait(FINALIZER_POLL_INTERVAL)
+
+            for index = 1, finalizerMaxIndex do
+                local state = finalizerStates[index]
+                if state then
+                    local wrapper = finalizerRefs[index]
+                    if wrapper == nil then
+                        release_finalizer_slot(index)
+                        state.finalizerIndex = nil
+
+                        if state.autoClose then
+                            local handle = state.handle
+                            clear_library_state(state)
+
+                            if handle then
+                                local ok, err = pcall(native.dlclose, handle)
+                                if not ok then
+                                    warn_if_available(string.format(
+                                        "ffi: failed to close library '%s': %s",
+                                        state.name,
+                                        tostring(err)
+                                    ))
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function register_library_finalizer(wrapper: any, state: LibraryState)
+    local slot = table.remove(finalizerFreeSlots)
+    if slot == nil then
+        finalizerMaxIndex += 1
+        slot = finalizerMaxIndex
+    end
+
+    finalizerRefs[slot] = wrapper
+    finalizerStates[slot] = state
+    state.finalizerIndex = slot
+
+    ensure_finalizer_loop()
+end
+
+local function unregister_library_finalizer(state: LibraryState)
+    local slot = state.finalizerIndex
+    if not slot then
+        return
+    end
+
+    state.finalizerIndex = nil
+    release_finalizer_slot(slot)
+end
 
 local function trim(value: string): string
     local stripped = value:gsub("^%s+", "")
@@ -1140,16 +1252,21 @@ error(string.format("TODO(@lune/ffi): %s not implemented yet", name), 2)
 end
 
 local function ensure_handle(state: LibraryState)
-if not state.handle then
-error(string.format("Library '%s' has been closed", state.name), 3)
-end
-return state.handle
+    if not state.handle then
+        error(string.format("Library '%s' has been closed", state.name), 3)
+    end
+    return state.handle
 end
 
 local symbol_mt = {}
 symbol_mt.__index = symbol_mt
 
 function symbol_mt:__call(...)
+    local state: LibraryState? = rawget(self, "__state")
+    if state then
+        ensure_handle(state)
+    end
+
     local signature = get_function_signature(self.__name)
     if not signature then
         error(string.format("No ctype registered for symbol '%s'", self.__name), 2)
@@ -1173,10 +1290,12 @@ function symbol_mt:__tostring()
 return string.format("cfunction: %s", self.__name)
 end
 
-local function create_symbol_proxy(name: string, ptr: NativeHandle)
+local function create_symbol_proxy(name: string, ptr: NativeHandle, library: any, state: LibraryState)
     return setmetatable({
         __name = name,
         __ptr = ptr,
+        __library = library,
+        __state = state,
     }, symbol_mt)
 end
 
@@ -1202,7 +1321,7 @@ library_mt.__index = function(self, key)
     if not sym then
         error(err or string.format("Symbol '%s' not found", key), 2)
     end
-    local proxy = create_symbol_proxy(key, sym)
+    local proxy = create_symbol_proxy(key, sym, self, state)
     state.symbols[key] = proxy
     return proxy
 end
@@ -1222,16 +1341,15 @@ function library_mt:close(): boolean
         return false
     end
 
+    unregister_library_finalizer(state)
+
     local ok, err = pcall(native.dlclose, handle)
     if not ok then
+        register_library_finalizer(self, state)
         error(err, 2)
     end
 
-    state.handle = nil
-    state.symbols = {}
-    if state.cacheKey then
-        libraryCache[state.cacheKey] = nil
-    end
+    clear_library_state(state)
     return true
 end
 
@@ -1245,29 +1363,6 @@ function library_mt:__tostring()
     return "clibrary: <invalid>"
 end
 
-function library_mt:__gc()
-    local state: LibraryState = rawget(self, "__state")
-    if not state or not state.autoClose then
-        return
-    end
-
-    local handle = state.handle
-    if not handle then
-        return
-    end
-
-    state.handle = nil
-    state.symbols = {}
-    if state.cacheKey then
-        libraryCache[state.cacheKey] = nil
-    end
-
-    local ok, err = pcall(native.dlclose, handle)
-    if not ok then
-        warn_if_available(string.format("ffi: failed to close library '%s': %s", state.name, tostring(err)))
-    end
-end
-
 local function wrap_library(handle: NativeHandle, name: string, autoClose: boolean, cacheKey: string?)
     local state: LibraryState = {
         handle = handle,
@@ -1275,8 +1370,13 @@ local function wrap_library(handle: NativeHandle, name: string, autoClose: boole
         autoClose = autoClose,
         symbols = {},
         cacheKey = cacheKey,
+        finalizerIndex = nil,
     }
-    return setmetatable({ __state = state }, library_mt)
+    local library = setmetatable({ __state = state }, library_mt)
+    if autoClose then
+        register_library_finalizer(library, state)
+    end
+    return library
 end
 
 local function is_cdata(value: any): boolean
