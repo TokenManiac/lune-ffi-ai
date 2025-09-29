@@ -59,6 +59,9 @@ type CType = {
     size: number?,
     align: number?,
     base: CType?,
+    fields: { RecordField }?,
+    fieldMap: { [string]: RecordField }?,
+    values: { EnumEntry }?,
 }
 
 type TypeResolveResult = CType
@@ -70,6 +73,8 @@ type RecordField = {
     name: string,
     ctype: CType,
     bitWidth: number?,
+    offset: number?,
+    bitOffset: number?,
 }
 
 type EnumEntry = {
@@ -228,6 +233,7 @@ function TypeRegistry:defineRecord(recordKind: string, tag: string?, fields: { R
         name = make_record_name(recordKind, tag, anonymousId),
         code = recordKind,
         fields = fields,
+        fieldMap = {},
     }
 
     if tag then
@@ -272,6 +278,8 @@ function TypeRegistry:defineEnum(tag: string?, entries: { EnumEntry }): CType
         name = if tag then string.format("enum %s", tag) else string.format("enum<anonymous:%d>", anonymousId),
         code = "enum",
         values = entries,
+        size = PRIMITIVE_LAYOUTS.int.size,
+        align = PRIMITIVE_LAYOUTS.int.align,
     }
 
     if tag then
@@ -1224,14 +1232,185 @@ local function resolve_ctype(value: any): CType
     error("invalid ctype specification", 3)
 end
 
-local function get_type_size(descriptor: CType): number
+local get_type_size: (descriptor: CType) -> number
+local get_type_align: (descriptor: CType) -> number
+
+local function align_to(value: number, alignment: number): number
+    if alignment <= 0 then
+        return value
+    end
+
+    local remainder = value % alignment
+    if remainder == 0 then
+        return value
+    end
+
+    return value + (alignment - remainder)
+end
+
+local function ensure_layout(descriptor: CType)
+    if descriptor.kind == "enum" then
+        if type(descriptor.size) ~= "number" or type(descriptor.align) ~= "number" then
+            local layout = PRIMITIVE_LAYOUTS.int
+            descriptor.size = layout.size
+            descriptor.align = layout.align
+        end
+        return
+    end
+
+    if descriptor.kind ~= "struct" and descriptor.kind ~= "union" then
+        return
+    end
+
+    local fields = descriptor.fields
+    if not fields then
+        descriptor.size = descriptor.size or 0
+        descriptor.align = descriptor.align or 1
+        return
+    end
+
+    local function ensure_field_map(): { [string]: RecordField }
+        local map = descriptor.fieldMap
+        if not map then
+            map = {}
+            descriptor.fieldMap = map
+        else
+            table.clear(map)
+        end
+        return map
+    end
+
+    if descriptor.kind == "union" then
+        if type(descriptor.size) == "number" and type(descriptor.align) == "number" then
+            return
+        end
+
+        local map = ensure_field_map()
+        local maxAlign = 1
+        local maxSize = 0
+
+        for _, field in ipairs(fields) do
+            local fieldType = field.ctype
+            ensure_layout(fieldType)
+            local align = fieldType.align or 1
+            if align > maxAlign then
+                maxAlign = align
+            end
+
+            local size = get_type_size(fieldType)
+            if field.bitWidth ~= nil then
+                if field.bitWidth < 0 then
+                    error("bitfield width must be non-negative", 3)
+                end
+                local maxBits = size * 8
+                if field.bitWidth > maxBits then
+                    error("TODO(@lune/ffi/layout): bitfield width exceeds storage unit", 3)
+                end
+                field.bitOffset = 0
+            else
+                field.bitOffset = nil
+            end
+
+            field.offset = 0
+            if size > maxSize then
+                maxSize = size
+            end
+            map[field.name] = field
+        end
+
+        descriptor.align = if maxAlign > 0 then maxAlign else 1
+        descriptor.size = align_to(maxSize, descriptor.align)
+        return
+    end
+
+    if type(descriptor.size) == "number" and type(descriptor.align) == "number" then
+        return
+    end
+
+    local map = ensure_field_map()
+    local offset = 0
+    local maxAlign = 1
+
+    local active = nil :: { type: CType, offset: number, size: number, bitsUsed: number }?
+
+    local function flush_active()
+        if active then
+            offset = active.offset + active.size
+            active = nil
+        end
+    end
+
+    for _, field in ipairs(fields) do
+        local fieldType = field.ctype
+        ensure_layout(fieldType)
+        local align = fieldType.align or 1
+        if align > maxAlign then
+            maxAlign = align
+        end
+
+        if field.bitWidth ~= nil then
+            if field.bitWidth < 0 then
+                error("bitfield width must be non-negative", 3)
+            end
+
+            local unitSize = get_type_size(fieldType)
+            local unitBits = unitSize * 8
+            if unitBits == 0 then
+                error("TODO(@lune/ffi/layout): zero-sized bitfield storage not supported", 3)
+            end
+            if field.bitWidth > unitBits then
+                error("TODO(@lune/ffi/layout): bitfield width exceeds storage unit", 3)
+            end
+
+            if not active or active.type ~= fieldType or active.bitsUsed >= unitBits or active.bitsUsed + field.bitWidth > unitBits then
+                flush_active()
+                offset = align_to(offset, align)
+                active = {
+                    type = fieldType,
+                    offset = offset,
+                    size = unitSize,
+                    bitsUsed = 0,
+                }
+            end
+
+            local container = active :: { type: CType, offset: number, size: number, bitsUsed: number }
+            field.offset = container.offset
+            field.bitOffset = container.bitsUsed
+            container.bitsUsed += field.bitWidth
+            if container.bitsUsed == unitBits then
+                flush_active()
+            end
+        else
+            flush_active()
+            offset = align_to(offset, align)
+            field.offset = offset
+            field.bitOffset = nil
+            offset += get_type_size(fieldType)
+        end
+
+        map[field.name] = field
+    end
+
+    flush_active()
+
+    if maxAlign < 1 then
+        maxAlign = 1
+    end
+
+    descriptor.align = maxAlign
+    descriptor.size = align_to(offset, maxAlign)
+end
+
+get_type_size = function(descriptor: CType): number
+    ensure_layout(descriptor)
     if type(descriptor.size) == "number" then
         return descriptor.size
     end
     error(string.format("TODO(@lune/ffi/types): sizeof for type '%s' not implemented", descriptor.name), 3)
 end
 
-local function get_type_align(descriptor: CType): number
+get_type_align = function(descriptor: CType): number
+    ensure_layout(descriptor)
     if type(descriptor.align) == "number" then
         return descriptor.align
     end
@@ -1488,16 +1667,47 @@ function ffi.metatype(_: any, _methods: { [string]: any })
 todo("ffi.metatype")
 end
 
-function ffi.sizeof(_: any): number
-todo("ffi.sizeof")
+function ffi.sizeof(spec: any): number
+    local descriptor = resolve_ctype(spec)
+    return get_type_size(descriptor)
 end
 
-function ffi.alignof(_: any): number
-todo("ffi.alignof")
+function ffi.alignof(spec: any): number
+    local descriptor = resolve_ctype(spec)
+    return get_type_align(descriptor)
 end
 
-function ffi.offsetof(_: any, _field: string): number
-todo("ffi.offsetof")
+function ffi.offsetof(spec: any, field: string): number
+    if type(field) ~= "string" then
+        error("ffi.offsetof expects field name string", 2)
+    end
+
+    local descriptor = resolve_ctype(spec)
+    if descriptor.kind ~= "struct" and descriptor.kind ~= "union" then
+        error("ffi.offsetof expects a struct or union type", 2)
+    end
+
+    ensure_layout(descriptor)
+    local map = descriptor.fieldMap
+    if not map then
+        error("TODO(@lune/ffi/offsetof): missing field metadata", 2)
+    end
+
+    local entry = map[field]
+    if not entry then
+        error(string.format("field '%s' not found", field), 2)
+    end
+
+    if entry.bitWidth ~= nil then
+        error("TODO(@lune/ffi/offsetof): bitfield offsets not supported", 2)
+    end
+
+    local offset = entry.offset
+    if type(offset) ~= "number" then
+        error("TODO(@lune/ffi/offsetof): offset metadata missing", 2)
+    end
+
+    return offset
 end
 
 function ffi.abi(...: string): boolean
