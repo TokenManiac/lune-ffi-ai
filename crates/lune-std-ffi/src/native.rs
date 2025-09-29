@@ -6,7 +6,20 @@ use std::slice;
 use mlua::prelude::*;
 
 use crate::call;
+use crate::callback;
 use crate::types::{self, TypeCode};
+
+type TestCallback = unsafe extern "C" fn(c_int) -> c_int;
+
+#[allow(dead_code)]
+unsafe extern "C" {
+    fn luneffi_test_call_callback(cb: Option<TestCallback>, value: c_int) -> c_int;
+}
+
+#[used]
+#[allow(dead_code)]
+static LUNEFFI_KEEP_TEST_CALLBACK: unsafe extern "C" fn(Option<TestCallback>, c_int) -> c_int =
+    luneffi_test_call_callback;
 
 use libc::{calloc, free, memcpy, size_t};
 
@@ -559,6 +572,8 @@ pub fn create(lua: &Lua) -> LuaResult<LuaTable> {
         },
     )?;
     table.set("call", call_fn)?;
+
+    callback::register(lua, &table)?;
 
     Ok(table)
 }

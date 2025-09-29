@@ -621,7 +621,196 @@ local function split_tokens(tokens: { Token }, separator: string): { { Token } }
     return parts
 end
 
-local function resolve_type_from_tokens(rawTokens: { Token }): CType
+local resolve_type_from_tokens: (rawTokens: { Token }) -> CType
+
+local function parse_parameter_descriptor(sequence: { Token }): CType
+    local descriptor: CType?
+    local message: string?
+
+    local function attempt(tokensToParse: { Token }): boolean
+        local ok, result = pcall(resolve_type_from_tokens, tokensToParse)
+        if ok then
+            descriptor = result
+            return true
+        end
+        message = result
+        return false
+    end
+
+    if not attempt(sequence) then
+        local last = sequence[#sequence]
+        if last and last.kind == "identifier" and not QUALIFIERS[last.value:lower()] then
+            if #sequence == 1 then
+                error(message or "failed to parse parameter type", 3)
+            end
+
+            local trimmed = table.create(#sequence - 1)
+            for index = 1, #sequence - 1 do
+                trimmed[index] = sequence[index]
+            end
+
+            if not attempt(trimmed) then
+                error(message or "failed to parse parameter type", 3)
+            end
+        else
+            error(message or "failed to parse parameter type", 3)
+        end
+    end
+
+    return descriptor :: CType
+end
+
+local function try_parse_function_pointer(tokens: { Token }): CType?
+    local firstParen: number? = nil
+    for index = 1, #tokens do
+        if tokens[index].value == '(' then
+            firstParen = index
+            break
+        end
+    end
+
+    if not firstParen then
+        return nil
+    end
+
+    local afterOpen = firstParen + 1
+    if afterOpen > #tokens or tokens[afterOpen].value ~= '*' then
+        return nil
+    end
+
+    local depth = 0
+    local closeIndex: number? = nil
+    for index = firstParen, #tokens do
+        local token = tokens[index].value
+        if token == '(' then
+            depth += 1
+        elseif token == ')' then
+            depth -= 1
+            if depth == 0 then
+                closeIndex = index
+                break
+            end
+        end
+    end
+
+    if not closeIndex then
+        error("unterminated function pointer declarator", 3)
+    end
+
+    local starCount = 0
+    for index = firstParen + 1, closeIndex - 1 do
+        local token = tokens[index]
+        if token.value == '*' then
+            starCount += 1
+        elseif token.kind == "identifier" then
+            continue
+        else
+            error("TODO(@lune/ffi/cdef): complex function pointer declarators not supported", 3)
+        end
+    end
+
+    if starCount ~= 1 then
+        error("TODO(@lune/ffi/cdef): function pointer declarators with multiple indirections not supported", 3)
+    end
+
+    local paramStart = closeIndex + 1
+    if paramStart > #tokens or tokens[paramStart].value ~= '(' then
+        return nil
+    end
+
+    local depthParams = 1
+    local paramEnd: number? = nil
+    for index = paramStart + 1, #tokens do
+        local token = tokens[index].value
+        if token == '(' then
+            depthParams += 1
+        elseif token == ')' then
+            depthParams -= 1
+            if depthParams == 0 then
+                paramEnd = index
+                break
+            end
+        end
+    end
+
+    if not paramEnd then
+        error("unterminated parameter list in function pointer", 3)
+    end
+
+    if paramEnd ~= #tokens then
+        error("TODO(@lune/ffi/cdef): trailing tokens after function pointer declarator", 3)
+    end
+
+    local returnTokens = {}
+    for index = 1, firstParen - 1 do
+        returnTokens[index] = tokens[index]
+    end
+
+    if #returnTokens == 0 then
+        error("function pointer missing return type", 3)
+    end
+
+    local returnType = resolve_type_from_tokens(returnTokens)
+
+    local paramTokens = {}
+    for index = paramStart + 1, paramEnd - 1 do
+        paramTokens[#paramTokens + 1] = tokens[index]
+    end
+
+    local args = {}
+    local variadic = false
+    if #paramTokens > 0 then
+        local sequences = split_tokens(paramTokens, ',')
+        for _, sequence in ipairs(sequences) do
+            if #sequence == 0 then
+                continue
+            end
+
+            if #sequence == 1 and sequence[1].value == 'void' and not variadic and #sequences == 1 then
+                continue
+            end
+
+            if #sequence == 1 and sequence[1].value == '...' then
+                variadic = true
+                continue
+            end
+
+            local descriptor = parse_parameter_descriptor(sequence)
+            table.insert(args, descriptor)
+        end
+    end
+
+    local displayParts = table.create(#args)
+    for index = 1, #args do
+        local ty = args[index]
+        displayParts[index] = ty.name or ty.code or string.format("arg%d", index)
+    end
+    if variadic then
+        table.insert(displayParts, "...")
+    end
+
+    local signatureText = table.concat(displayParts, ", ")
+    local functionName = if signatureText == "" then string.format("%s()", returnType.name) else string.format("%s(%s)", returnType.name, signatureText)
+
+    local descriptor: CType & { result: CType, args: { CType }, variadic: boolean?, fixedCount: number?, abi: string? } = {
+        kind = "function",
+        name = string.format("function<%s>", functionName),
+        code = "function",
+        result = returnType,
+        args = args,
+        variadic = variadic,
+        fixedCount = #args,
+    }
+
+    return typeRegistry:makePointer(descriptor)
+end
+
+resolve_type_from_tokens = function(rawTokens: { Token }): CType
+    local maybeFunctionPointer = try_parse_function_pointer(rawTokens)
+    if maybeFunctionPointer then
+        return maybeFunctionPointer
+    end
+
     local values = {}
     for index = 1, #rawTokens do
         values[index] = rawTokens[index].value
@@ -949,37 +1138,7 @@ local function parse_function(statement: string)
                 continue
             end
 
-            local descriptor: CType?
-            local ok = true
-            local message = nil
-
-            local function attempt(tokensToParse)
-                local okParse, result = pcall(resolve_type_from_tokens, tokensToParse)
-                if okParse then
-                    descriptor = result
-                    return true
-                end
-                message = result
-                return false
-            end
-
-            if not attempt(sequence) then
-                local last = sequence[#sequence]
-                if last.kind == "identifier" and not QUALIFIERS[last.value:lower()] then
-                    local trimmed = table.create(#sequence - 1)
-                    for index = 1, #sequence - 1 do
-                        trimmed[index] = sequence[index]
-                    end
-                    ok = attempt(trimmed)
-                else
-                    ok = false
-                end
-            end
-
-            if not ok or not descriptor then
-                error(message or "failed to parse function argument type", 3)
-            end
-
+            local descriptor = parse_parameter_descriptor(sequence)
             table.insert(args, descriptor)
         end
     end
@@ -1005,19 +1164,62 @@ local function parse_typedef(statement: string)
         table.insert(body, tokens[index])
     end
 
+    while #body > 0 and body[#body].value == ';' do
+        table.remove(body)
+    end
+
     if #body == 0 then
         error("typedef missing target type", 3)
     end
 
-    local aliasToken = body[#body]
-    if aliasToken.kind ~= "identifier" then
+    local aliasIndex: number? = nil
+    local parenDepth = 0
+    local bracketDepth = 0
+    local braceDepth = 0
+    for index = #body, 1, -1 do
+        local token = body[index]
+        local value = token.value
+        if value == ')' then
+            parenDepth += 1
+        elseif value == '(' then
+            parenDepth -= 1
+        elseif value == ']' then
+            bracketDepth += 1
+        elseif value == '[' then
+            bracketDepth -= 1
+        elseif value == '}' then
+            braceDepth += 1
+        elseif value == '{' then
+            braceDepth -= 1
+        elseif token.kind == "identifier" then
+            local outside = parenDepth == 0 and bracketDepth == 0 and braceDepth == 0
+            local pointerName = parenDepth == 1
+                and bracketDepth == 0
+                and braceDepth == 0
+                and index > 1
+                and body[index - 1].value == '*'
+
+            if outside or pointerName then
+                aliasIndex = index
+                break
+            end
+        end
+    end
+
+    if not aliasIndex then
         error("typedef target name must be an identifier", 3)
     end
 
+    local aliasToken = body[aliasIndex]
     local alias = aliasToken.value
+
     local typeTokens = table.create(#body - 1)
-    for index = 1, #body - 1 do
-        typeTokens[index] = body[index]
+    local offset = 1
+    for index = 1, #body do
+        if index ~= aliasIndex then
+            typeTokens[offset] = body[index]
+            offset += 1
+        end
     end
 
     if #typeTokens == 0 then
@@ -1026,12 +1228,6 @@ local function parse_typedef(statement: string)
 
     local descriptor
     local ok, message = pcall(function()
-        for index = 1, #typeTokens do
-            if typeTokens[index].value == '(' then
-                error("TODO(@lune/ffi/cdef): function pointer typedefs not implemented", 3)
-            end
-        end
-
         descriptor = parse_type_specifier(typeTokens)
     end)
 
@@ -1133,6 +1329,23 @@ end
 
 local function get_function_signature(name: string): FunctionSignature?
     return registry.functions[name]
+end
+
+local function signature_from_descriptor(descriptor: CType & { result: CType, args: { CType }?, variadic: boolean?, fixedCount: number?, abi: string? }): FunctionSignature
+    local args = descriptor.args or {}
+    local copy = table.create(#args)
+    for index = 1, #args do
+        copy[index] = args[index]
+    end
+    local fixed = if descriptor.fixedCount then descriptor.fixedCount else #copy
+    return {
+        kind = "function",
+        result = descriptor.result,
+        args = copy,
+        abi = descriptor.abi,
+        variadic = descriptor.variadic,
+        fixedCount = fixed,
+    }
 end
 
 local function todo(name: string): ()
@@ -1843,8 +2056,28 @@ function ffi.cast(spec: any, value: any): any
     local descriptor = resolve_ctype(spec)
 
     if descriptor.kind == "pointer" then
+        local base = rawget(descriptor, "base")
+        if base and base.kind == "function" and type(value) == "function" then
+            local signature = signature_from_descriptor(base)
+            local ptr, handle = native.createCallback(signature, value)
+            local cdata = create_cdata(descriptor, ptr, false)
+            if handle ~= nil then
+                rawset(cdata, "__callback_handle", handle)
+            end
+            return cdata
+        end
+
+        local callbackHandle = nil
+        if type(value) == "table" and is_cdata(value) then
+            callbackHandle = rawget(value, "__callback_handle")
+        end
+
         local pointerValue = coerce_pointer_value(value)
-        return create_cdata(descriptor, pointerValue, false)
+        local object = create_cdata(descriptor, pointerValue, false)
+        if callbackHandle ~= nil then
+            rawset(object, "__callback_handle", callbackHandle)
+        end
+        return object
     elseif descriptor.kind == "primitive" then
         return allocate_primitive(descriptor, value)
     end

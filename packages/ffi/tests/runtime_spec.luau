@@ -173,6 +173,31 @@ return function(ctx)
         assert(representation:find("int*", 1, true) ~= nil, "custom tostring should include prefix")
     end)
 
+    test("ffi.cast bridges Luau callbacks to C function pointers", function()
+        ffi.cdef([[typedef int (*RuntimeUnary)(int);
+int luneffi_test_call_callback(RuntimeUnary cb, int value);]])
+
+        local cbType = ffi.typeof("RuntimeUnary")
+        local total = 0
+
+        local function handler(x)
+            total += x
+            return total
+        end
+
+        local cb = ffi.cast(cbType, handler)
+        local first = ffi.C.luneffi_test_call_callback(cb, 3)
+        assertEqual(first, 3)
+        assertEqual(total, 3)
+
+        local alias = ffi.cast("void*", cb)
+        cb = nil
+        local restored = ffi.cast(cbType, alias)
+        local second = ffi.C.luneffi_test_call_callback(restored, 4)
+        assertEqual(second, 7)
+        assertEqual(total, 7)
+    end)
+
     test("ffi.abi exposes platform information", function()
         local is32, is64 = ffi.abi("32bit"), ffi.abi("64bit")
         assert(is32 ~= is64, "exactly one of 32bit/64bit must be true")

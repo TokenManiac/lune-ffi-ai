@@ -1,189 +1,11 @@
 use std::convert::TryFrom;
 use std::ffi::{CString, c_void};
 
-use cfg_if::cfg_if;
-use libffi::middle::{self, Arg, Cif, CodePtr, Type};
+use libffi::middle::{Arg, Cif, CodePtr, Type};
 use mlua::prelude::*;
 
+use crate::signature::{CType, Signature};
 use crate::types::{self, TypeCode};
-
-impl TypeCode {
-    fn to_libffi_type(self) -> Type {
-        match self {
-            TypeCode::Void => Type::void(),
-            TypeCode::Int8 => Type::i8(),
-            TypeCode::UInt8 => Type::u8(),
-            TypeCode::Int16 => Type::i16(),
-            TypeCode::UInt16 => Type::u16(),
-            TypeCode::Int32 => Type::i32(),
-            TypeCode::UInt32 => Type::u32(),
-            TypeCode::Int64 => Type::i64(),
-            TypeCode::UInt64 => Type::u64(),
-            TypeCode::IntPtr => {
-                if cfg!(target_pointer_width = "64") {
-                    Type::i64()
-                } else {
-                    Type::i32()
-                }
-            }
-            TypeCode::UIntPtr => {
-                if cfg!(target_pointer_width = "64") {
-                    Type::u64()
-                } else {
-                    Type::u32()
-                }
-            }
-            TypeCode::Float32 => Type::f32(),
-            TypeCode::Float64 => Type::f64(),
-            TypeCode::Pointer => Type::pointer(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct CType {
-    code: TypeCode,
-}
-
-impl CType {
-    fn from_lua(value: LuaValue) -> LuaResult<Self> {
-        match value {
-            LuaValue::String(code) => {
-                let normalized = types::normalize_code(code.to_str()?.as_ref());
-                let ty = TypeCode::from_code(&normalized)?;
-                Ok(Self { code: ty })
-            }
-            LuaValue::Table(table) => {
-                let code: String = table.get("code").map_err(|_| {
-                    LuaError::runtime("Type descriptor missing 'code' field".to_string())
-                })?;
-                let normalized = types::normalize_code(&code);
-                let ty = TypeCode::from_code(&normalized)?;
-                Ok(Self { code: ty })
-            }
-            other => Err(LuaError::runtime(format!(
-                "Invalid type descriptor (expected table or string, got {other:?})"
-            ))),
-        }
-    }
-
-    fn to_libffi_type(&self) -> Type {
-        self.code.to_libffi_type()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum AbiChoice {
-    Explicit(middle::FfiAbi),
-    Default,
-}
-
-impl AbiChoice {
-    fn from_option(value: Option<String>) -> LuaResult<Self> {
-        match value.as_deref() {
-            None | Some("cdecl") | Some("default") => Ok(AbiChoice::Default),
-            Some("sysv") => {
-                cfg_if! {
-                    if #[cfg(all(target_arch = "x86_64", unix))] {
-                        Ok(AbiChoice::Explicit(libffi::raw::ffi_abi_FFI_UNIX64))
-                    } else if #[cfg(any(
-                        target_arch = "x86",
-                        target_arch = "arm",
-                        target_arch = "aarch64",
-                        target_arch = "powerpc",
-                    ))] {
-                        Ok(AbiChoice::Explicit(libffi::raw::ffi_abi_FFI_SYSV))
-                    } else if #[cfg(all(target_os = "windows", target_arch = "x86_64"))] {
-                        Ok(AbiChoice::Explicit(libffi::raw::ffi_abi_FFI_WIN64))
-                    } else {
-                        Err(LuaError::runtime("ABI 'sysv' not supported on this target".to_string()))
-                    }
-                }
-            }
-            Some("stdcall") => {
-                cfg_if! {
-                    if #[cfg(any(target_arch = "x86"))] {
-                        Ok(AbiChoice::Explicit(libffi::raw::ffi_abi_FFI_STDCALL))
-                    } else {
-                        Err(LuaError::runtime("ABI 'stdcall' requires x86 architecture".to_string()))
-                    }
-                }
-            }
-            Some("ms_abi") | Some("ms_cdecl") => {
-                cfg_if! {
-                    if #[cfg(all(target_os = "windows", target_arch = "x86"))] {
-                        Ok(AbiChoice::Explicit(libffi::raw::ffi_abi_FFI_MS_CDECL))
-                    } else if #[cfg(all(target_os = "windows", target_arch = "x86_64"))] {
-                        Ok(AbiChoice::Explicit(libffi::raw::ffi_abi_FFI_WIN64))
-                    } else {
-                        Err(LuaError::runtime("ABI 'ms_abi' only available on Windows targets".to_string()))
-                    }
-                }
-            }
-            Some("win64") => {
-                cfg_if! {
-                    if #[cfg(target_os = "windows")] {
-                        Ok(AbiChoice::Explicit(libffi::raw::ffi_abi_FFI_WIN64))
-                    } else {
-                        Err(LuaError::runtime("ABI 'win64' only available on Windows targets".to_string()))
-                    }
-                }
-            }
-            Some(other) => Err(LuaError::runtime(format!("Unsupported ABI '{other}'"))),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Signature {
-    abi: AbiChoice,
-    result: CType,
-    args: Vec<CType>,
-    variadic: bool,
-    fixed_count: usize,
-}
-
-impl Signature {
-    fn from_table(table: LuaTable) -> LuaResult<Self> {
-        let abi = AbiChoice::from_option(table.get::<Option<String>>("abi")?)?;
-        let result_value: LuaValue = table.get("result")?;
-        let result = CType::from_lua(result_value)?;
-
-        let args_table: LuaTable = table.get("args")?;
-        let mut args = Vec::with_capacity(args_table.raw_len() as usize);
-        for value in args_table.sequence_values::<LuaValue>() {
-            let value = value?;
-            args.push(CType::from_lua(value)?);
-        }
-
-        let variadic = table.get::<Option<bool>>("variadic")?.unwrap_or(false);
-        let fixed_count = table
-            .get::<Option<u32>>("fixedCount")?
-            .map_or(args.len(), |n| n as usize);
-
-        if fixed_count > args.len() {
-            return Err(LuaError::runtime(format!(
-                "Invalid signature: fixedCount ({fixed_count}) exceeds number of arguments ({})",
-                args.len()
-            )));
-        }
-
-        if !variadic && fixed_count != args.len() {
-            return Err(LuaError::runtime(
-                "Invalid signature: fixedCount must equal number of arguments for non-variadic functions"
-                    .to_string(),
-            ));
-        }
-
-        Ok(Signature {
-            abi,
-            result,
-            args,
-            variadic,
-            fixed_count,
-        })
-    }
-}
 
 #[derive(Debug)]
 enum ArgValue {
@@ -239,7 +61,7 @@ fn convert_typed_argument(
     ty: &CType,
     string_refs: &mut Vec<CString>,
 ) -> LuaResult<(ArgValue, TypeCode)> {
-    match ty.code {
+    match ty.code() {
         TypeCode::Void => Err(LuaError::runtime(
             "void type cannot be used as a function argument".to_string(),
         )),
@@ -440,15 +262,15 @@ fn collect_arguments(
     let explicit_n = args_table.get::<Option<u32>>("n")?.map(|n| n as usize);
     let arg_count = explicit_n.unwrap_or_else(|| args_table.raw_len() as usize);
 
-    if signature.variadic {
-        if arg_count < signature.fixed_count {
+    if signature.is_variadic() {
+        if arg_count < signature.fixed_count() {
             return Err(LuaError::runtime(format!(
                 "function expected at least {} argument(s) but received {arg_count}",
-                signature.fixed_count
+                signature.fixed_count()
             )));
         }
     } else {
-        let expected = signature.args.len();
+        let expected = signature.args().len();
         if arg_count != expected {
             return Err(LuaError::runtime(format!(
                 "function expected {expected} argument(s) but received {arg_count}"
@@ -462,9 +284,9 @@ fn collect_arguments(
 
     for index in 0..arg_count {
         let value = args_table.raw_get::<LuaValue>(index as i64 + 1)?;
-        let type_hint = signature.args.get(index);
+        let type_hint = signature.args().get(index);
 
-        if index < signature.fixed_count {
+        if index < signature.fixed_count() {
             let ty = type_hint.ok_or_else(|| {
                 LuaError::runtime(format!(
                     "missing type information for fixed argument {}",
@@ -478,7 +300,7 @@ fn collect_arguments(
             continue;
         }
 
-        if !signature.variadic {
+        if !signature.is_variadic() {
             let ty = type_hint.ok_or_else(|| {
                 LuaError::runtime(format!(
                     "missing type information for argument {}",
@@ -494,33 +316,13 @@ fn collect_arguments(
         let (arg, inferred) = convert_argument(value, type_hint, &mut string_refs)?;
         let ffi_type = match type_hint {
             Some(ty) => ty.to_libffi_type(),
-            None => inferred.to_libffi_type(),
+            None => CType { code: inferred }.to_libffi_type(),
         };
         arg_types.push(ffi_type);
         values.push(arg);
     }
 
     Ok((values, arg_types, string_refs))
-}
-
-fn build_cif(signature: &Signature, arg_types: &[Type]) -> Cif {
-    let result_type = signature.result.to_libffi_type();
-
-    let mut cif = if signature.variadic {
-        Cif::new_variadic(
-            arg_types.iter().cloned(),
-            signature.fixed_count,
-            result_type,
-        )
-    } else {
-        Cif::new(arg_types.iter().cloned(), result_type)
-    };
-
-    if let AbiChoice::Explicit(abi) = signature.abi {
-        cif.set_abi(abi);
-    }
-
-    cif
 }
 
 fn call_with_signature(
@@ -532,7 +334,7 @@ fn call_with_signature(
     let code_ptr = CodePtr::from_ptr(func.0 as *const c_void);
 
     unsafe {
-        match signature.result.code {
+        match signature.result().code() {
             TypeCode::Void => {
                 cif.call::<()>(code_ptr, args);
                 Ok(LuaValue::Nil)
@@ -624,7 +426,7 @@ pub fn call(
     let signature = Signature::from_table(signature_table)?;
     let (arg_values, arg_types, _owned_strings) = collect_arguments(args_table, &signature)?;
     let arg_refs: Vec<Arg> = arg_values.iter().map(ArgValue::as_arg).collect();
-    let cif = build_cif(&signature, &arg_types);
+    let cif = signature.build_cif(&arg_types);
     call_with_signature(&signature, func, cif, &arg_refs)
 }
 

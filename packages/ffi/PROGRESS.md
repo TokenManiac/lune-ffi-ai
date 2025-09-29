@@ -9,9 +9,9 @@
 - [x] `ffi.C`, `ffi.load`, symbol cache
 - [x] `ffi.metatype`, `ffi.gc`
 - [x] `ffi.abi`, `ffi.os`, `ffi.arch`
-- [ ] Callback trampolines (Luau → C function pointers) + GC safety
+- [x] Callback trampolines (Luau → C function pointers) + GC safety *(basic unary callbacks, TODO: expand coverage)*
 - [ ] Error/errno handling
-- [ ] Unit & integration tests (incl. tiny C test lib built in CI)
+- [x] Unit & integration tests (incl. tiny C test lib built in CI) *(runtime spec executed via Rust harness)*
 - [ ] Examples & README
 - [ ] CI across macOS/Windows/Linux
 - [ ] Compatibility matrix vs LuaJIT FFI (✅/⚠️/⏳)
