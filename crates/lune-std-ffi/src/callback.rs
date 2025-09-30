@@ -344,9 +344,7 @@ impl Drop for CallbackHandle {
             if !self.data.is_null() {
                 let mut data = Box::from_raw(self.data);
                 if let Some(key) = data.function_key.take() {
-                    if let Err(err) = data.lua.remove_registry_value(key) {
-                        eprintln!("ffi: failed to remove callback registry key: {err}");
-                    }
+                    drop(key);
                 }
             }
         }

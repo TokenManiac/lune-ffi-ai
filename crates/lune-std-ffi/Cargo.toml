@@ -19,3 +19,6 @@ libffi = "4.1.2"
 libc = "0.2"
 
 lune-utils = { version = "0.3.2", path = "../lune-utils" }
+
+[dev-dependencies]
+cc = "1.1"

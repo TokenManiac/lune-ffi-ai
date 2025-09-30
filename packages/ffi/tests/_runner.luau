@@ -28,11 +28,13 @@ local registry = {
     ffi = ffi,
     test = test,
     assertEqual = assertEqual,
+    exampleLibraryPath = rawget(_G, "FFI_EXAMPLE_LIBRARY_PATH"),
 }
 
 local modules = {
     require("./cdef_spec"),
     require("./runtime_spec"),
+    require("./example_spec"),
 }
 
 for _, register in ipairs(modules) do
