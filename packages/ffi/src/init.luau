@@ -17,6 +17,15 @@ local function ensure_task_library()
     return globalTask
 end
 
+local function warn_if_available(message: string)
+    local maybeWarn = rawget(_G, "warn")
+    if type(maybeWarn) == "function" then
+        maybeWarn(message)
+    else
+        print(message)
+    end
+end
+
 if type(native) ~= "table" then
     error("native bindings table is required", 2)
 end
@@ -90,6 +99,7 @@ local finalizerStates = {} :: { [number]: LibraryState }
 local finalizerFreeSlots = {} :: { [number]: number }
 local finalizerMaxIndex = 0
 local finalizerLoopActive = false
+local finalizerLoopSupported = true
 
 local function clear_library_state(state: LibraryState)
     state.handle = nil
@@ -107,12 +117,22 @@ end
 
 local function ensure_finalizer_loop()
     if finalizerLoopActive then
-        return
+        return true
+    end
+    if not finalizerLoopSupported then
+        return false
+    end
+
+    local ok, schedulerOrErr = pcall(ensure_task_library)
+    if not ok then
+        finalizerLoopSupported = false
+        warn_if_available("ffi: task library unavailable; library finalizers disabled")
+        return false
     end
 
     finalizerLoopActive = true
 
-    local scheduler = ensure_task_library()
+    local scheduler = schedulerOrErr
     local defer = scheduler.defer
     local wait = scheduler.wait
     if type(defer) ~= "function" or type(wait) ~= "function" then
@@ -154,6 +174,10 @@ local function ensure_finalizer_loop()
 end
 
 local function register_library_finalizer(wrapper: any, state: LibraryState)
+    if not ensure_finalizer_loop() then
+        return
+    end
+
     local slot = table.remove(finalizerFreeSlots)
     if slot == nil then
         finalizerMaxIndex += 1
@@ -163,8 +187,6 @@ local function register_library_finalizer(wrapper: any, state: LibraryState)
     finalizerRefs[slot] = wrapper
     finalizerStates[slot] = state
     state.finalizerIndex = slot
-
-    ensure_finalizer_loop()
 end
 
 local function unregister_library_finalizer(state: LibraryState)
@@ -180,15 +202,6 @@ end
 local function trim(value: string): string
     local stripped = value:gsub("^%s+", "")
     return stripped:gsub("%s+$", "")
-end
-
-local function warn_if_available(message: string)
-    local maybeWarn = rawget(_G, "warn")
-    if type(maybeWarn) == "function" then
-        maybeWarn(message)
-    else
-        print(message)
-    end
 end
 
 type CType = {
