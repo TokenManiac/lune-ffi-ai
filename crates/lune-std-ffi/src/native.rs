@@ -559,15 +559,15 @@ pub fn create(lua: &Lua) -> LuaResult<LuaTable> {
     })?;
     table.set("dlclose", dlclose_fn)?;
 
-    let errno_get_fn = lua.create_function(|_, ()| {
-        Ok(i64::from(get_errno()))
-    })?;
+    let errno_get_fn = lua.create_function(|_, ()| Ok(i64::from(get_errno())))?;
     table.set("getErrno", errno_get_fn)?;
 
     let errno_set_fn = lua.create_function(|_, value: LuaValue| {
         let coerced = types::lua_value_to_i64(&value)?;
         if coerced < c_int::MIN as i64 || coerced > c_int::MAX as i64 {
-            return Err(LuaError::runtime("errno value out of range for C int".to_string()));
+            return Err(LuaError::runtime(
+                "errno value out of range for C int".to_string(),
+            ));
         }
         set_errno(coerced as c_int);
         Ok(())

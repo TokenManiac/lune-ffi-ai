@@ -1,5 +1,6 @@
 use std::convert::TryFrom;
 use std::ffi::{CString, c_void};
+use std::ptr;
 
 use libffi::middle::{Arg, Cif, CodePtr, Type};
 use mlua::prelude::*;
@@ -40,19 +41,152 @@ impl ArgValue {
     }
 }
 
-fn extract_cdata_pointer(table: &LuaTable) -> LuaResult<Option<*mut c_void>> {
+#[derive(Clone, Copy, Debug)]
+struct CDataInfo {
+    ptr: Option<*mut c_void>,
+    type_code: Option<TypeCode>,
+}
+
+fn extract_cdata_info(table: &LuaTable) -> LuaResult<Option<CDataInfo>> {
     let marker = table.raw_get::<LuaValue>("__ffi_cdata")?;
     if !matches!(marker, LuaValue::Boolean(true)) {
         return Ok(None);
     }
 
     let ptr_value = table.raw_get::<LuaValue>("__ptr")?;
-    match ptr_value {
-        LuaValue::LightUserData(ptr) => Ok(Some(ptr.0)),
-        LuaValue::Nil => Ok(Some(std::ptr::null_mut())),
-        other => Err(LuaError::runtime(format!(
-            "cdata object missing native pointer (found {other:?})",
-        ))),
+    let ptr = match ptr_value {
+        LuaValue::LightUserData(ptr) => Some(ptr.0),
+        LuaValue::Nil => None,
+        other => {
+            return Err(LuaError::runtime(format!(
+                "cdata object missing native pointer (found {other:?})",
+            )));
+        }
+    };
+
+    let type_value = table.raw_get::<LuaValue>("__ctype")?;
+    let type_code = match type_value {
+        LuaValue::Nil => None,
+        LuaValue::String(code) => {
+            let normalized = types::normalize_code(code.to_str()?.as_ref());
+            match TypeCode::from_code(&normalized) {
+                Ok(code) => Some(code),
+                Err(_) => None,
+            }
+        }
+        LuaValue::Table(descriptor) => {
+            let code_value = descriptor.raw_get::<LuaValue>("code")?;
+            match code_value {
+                LuaValue::String(code) => {
+                    let normalized = types::normalize_code(code.to_str()?.as_ref());
+                    match TypeCode::from_code(&normalized) {
+                        Ok(code) => Some(code),
+                        Err(_) => None,
+                    }
+                }
+                LuaValue::Nil => None,
+                other => {
+                    return Err(LuaError::runtime(format!(
+                        "cdata descriptor missing string code (found {other:?})",
+                    )));
+                }
+            }
+        }
+        other => {
+            return Err(LuaError::runtime(format!(
+                "cdata object has invalid __ctype field (found {other:?})",
+            )));
+        }
+    };
+
+    Ok(Some(CDataInfo { ptr, type_code }))
+}
+
+fn extract_cdata_pointer(table: &LuaTable) -> LuaResult<Option<*mut c_void>> {
+    let info = match extract_cdata_info(table)? {
+        Some(info) => info,
+        None => return Ok(None),
+    };
+
+    Ok(Some(info.ptr.unwrap_or(std::ptr::null_mut())))
+}
+
+fn convert_cdata_variadic_argument(
+    info: CDataInfo,
+    original_type: TypeCode,
+) -> LuaResult<(ArgValue, TypeCode)> {
+    let ptr = info.ptr.ok_or_else(|| {
+        LuaError::runtime("cdata value missing native storage pointer".to_string())
+    })?;
+
+    unsafe {
+        match original_type {
+            TypeCode::Void => Err(LuaError::runtime(
+                "void type cannot be used as a variadic argument".to_string(),
+            )),
+            TypeCode::Int8 => {
+                let raw = ptr::read(ptr as *const i8);
+                Ok((ArgValue::Int32(raw as i32), TypeCode::Int32))
+            }
+            TypeCode::UInt8 => {
+                let raw = ptr::read(ptr as *const u8);
+                Ok((ArgValue::Int32(raw as i32), TypeCode::Int32))
+            }
+            TypeCode::Int16 => {
+                let raw = ptr::read(ptr as *const i16);
+                Ok((ArgValue::Int32(raw as i32), TypeCode::Int32))
+            }
+            TypeCode::UInt16 => {
+                let raw = ptr::read(ptr as *const u16);
+                Ok((ArgValue::Int32(raw as i32), TypeCode::Int32))
+            }
+            TypeCode::Int32 => {
+                let raw = ptr::read(ptr as *const i32);
+                Ok((ArgValue::Int32(raw), TypeCode::Int32))
+            }
+            TypeCode::UInt32 => {
+                let raw = ptr::read(ptr as *const u32);
+                Ok((ArgValue::UInt32(raw), TypeCode::UInt32))
+            }
+            TypeCode::Int64 => {
+                let raw = ptr::read(ptr as *const i64);
+                Ok((ArgValue::Int64(raw), TypeCode::Int64))
+            }
+            TypeCode::UInt64 => {
+                let raw = ptr::read(ptr as *const u64);
+                Ok((ArgValue::UInt64(raw), TypeCode::UInt64))
+            }
+            TypeCode::IntPtr => {
+                if cfg!(target_pointer_width = "64") {
+                    let raw = ptr::read(ptr as *const i64);
+                    Ok((ArgValue::Int64(raw), TypeCode::IntPtr))
+                } else {
+                    let raw = ptr::read(ptr as *const i32);
+                    Ok((ArgValue::Int32(raw), TypeCode::IntPtr))
+                }
+            }
+            TypeCode::UIntPtr => {
+                if cfg!(target_pointer_width = "64") {
+                    let raw = ptr::read(ptr as *const u64);
+                    Ok((ArgValue::UInt64(raw), TypeCode::UIntPtr))
+                } else {
+                    let raw = ptr::read(ptr as *const u32);
+                    Ok((ArgValue::UInt32(raw), TypeCode::UIntPtr))
+                }
+            }
+            TypeCode::Float32 => {
+                let raw = ptr::read(ptr as *const f32);
+                Ok((ArgValue::Float64(raw as f64), TypeCode::Float64))
+            }
+            TypeCode::Float64 => {
+                let raw = ptr::read(ptr as *const f64);
+                Ok((ArgValue::Float64(raw), TypeCode::Float64))
+            }
+            TypeCode::Pointer => Ok((
+                ArgValue::Pointer(ptr::read(ptr as *const *mut c_void)),
+                TypeCode::Pointer,
+            )),
+        }
     }
 }
 
@@ -140,15 +274,12 @@ fn convert_typed_argument(
         TypeCode::Pointer => match value {
             LuaValue::Nil => Ok((ArgValue::Pointer(std::ptr::null_mut()), TypeCode::Pointer)),
             LuaValue::LightUserData(ptr) => Ok((ArgValue::Pointer(ptr.0), TypeCode::Pointer)),
-            LuaValue::Table(table) => {
-                if let Some(ptr) = extract_cdata_pointer(&table)? {
-                    Ok((ArgValue::Pointer(ptr), TypeCode::Pointer))
-                } else {
-                    Err(LuaError::runtime(
-                        "cannot convert table value to pointer argument".to_string(),
-                    ))
-                }
-            }
+            LuaValue::Table(table) => match extract_cdata_pointer(&table)? {
+                Some(ptr) => Ok((ArgValue::Pointer(ptr), TypeCode::Pointer)),
+                None => Err(LuaError::runtime(
+                    "cannot convert table value to pointer argument".to_string(),
+                )),
+            },
             LuaValue::Integer(i) => Ok((
                 ArgValue::Pointer(
                     usize::try_from(i)
@@ -197,19 +328,31 @@ fn convert_variadic_argument(
     value: LuaValue,
     string_refs: &mut Vec<CString>,
 ) -> LuaResult<(ArgValue, TypeCode)> {
-    // TODO(ffi/callbridge): support full LuaJIT vararg semantics including cdata promotion rules
-    // and soft-float calling conventions.
     match value {
         LuaValue::Nil => Ok((ArgValue::Pointer(std::ptr::null_mut()), TypeCode::Pointer)),
         LuaValue::LightUserData(ptr) => Ok((ArgValue::Pointer(ptr.0), TypeCode::Pointer)),
         LuaValue::Table(table) => {
-            if let Some(ptr) = extract_cdata_pointer(&table)? {
-                Ok((ArgValue::Pointer(ptr), TypeCode::Pointer))
-            } else {
-                Err(LuaError::runtime(
-                    "cannot infer C type for variadic table argument".to_string(),
-                ))
+            if let Some(info) = extract_cdata_info(&table)? {
+                if let Some(type_code) = info.type_code {
+                    if matches!(type_code, TypeCode::Pointer) {
+                        let ptr = info.ptr.unwrap_or(std::ptr::null_mut());
+                        return Ok((ArgValue::Pointer(ptr), TypeCode::Pointer));
+                    }
+                    return convert_cdata_variadic_argument(info, type_code);
+                }
+
+                if let Some(ptr) = info.ptr {
+                    return Ok((ArgValue::Pointer(ptr), TypeCode::Pointer));
+                }
+
+                return Err(LuaError::runtime(
+                    "cannot infer C type for variadic cdata argument".to_string(),
+                ));
             }
+
+            Err(LuaError::runtime(
+                "cannot infer C type for variadic table argument".to_string(),
+            ))
         }
         LuaValue::String(s) => {
             let owned = CString::new(s.as_bytes().as_ref())
@@ -436,6 +579,29 @@ mod tests {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_void};
 
+    struct RawBox<T>(*mut T);
+
+    impl<T> RawBox<T> {
+        fn new(value: T) -> Self {
+            RawBox(Box::into_raw(Box::new(value)))
+        }
+
+        fn ptr(&self) -> *mut T {
+            self.0
+        }
+    }
+
+    impl<T> Drop for RawBox<T> {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    drop(Box::from_raw(self.0));
+                }
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
+
     unsafe extern "C" {
         fn luneffi_test_add_ints(a: i32, b: i32) -> i32;
         fn luneffi_test_variadic_sum(count: i32, ...) -> i32;
@@ -479,6 +645,19 @@ mod tests {
         }
         args.set("n", len)?;
         Ok(args)
+    }
+
+    fn make_cdata_table(lua: &Lua, code: &str, ptr: *mut c_void) -> LuaResult<LuaTable> {
+        let table = lua.create_table()?;
+        table.raw_set("__ffi_cdata", LuaValue::Boolean(true))?;
+        table.raw_set("__ptr", LuaValue::LightUserData(LuaLightUserData(ptr)))?;
+
+        let descriptor = lua.create_table()?;
+        descriptor.set("code", code)?;
+        descriptor.set("kind", "primitive")?;
+        table.raw_set("__ctype", LuaValue::Table(descriptor))?;
+
+        Ok(table)
     }
 
     #[test]
@@ -547,6 +726,49 @@ mod tests {
 
         let c_str = unsafe { CStr::from_ptr(buffer.as_ptr()) };
         assert_eq!(c_str.to_str().unwrap(), "4 + 7 = 11");
+        Ok(())
+    }
+
+    #[test]
+    fn call_variadic_uses_cdata_type_information() -> LuaResult<()> {
+        let lua = Lua::new();
+        let signature = make_signature(&lua, "int32", &["pointer", "size_t", "pointer"], true, 3)?;
+
+        let mut buffer: [c_char; 128] = [0; 128];
+        let format = lua.create_string("%lld %.2f")?;
+
+        let big_value_raw: i64 = 1_234_567_890_123;
+        let float_value_raw: f32 = 3.25;
+        let big_value = RawBox::new(big_value_raw);
+        let float_value = RawBox::new(float_value_raw);
+
+        let int_cdata = make_cdata_table(&lua, "int64", big_value.ptr() as *mut c_void)?;
+        let float_cdata = make_cdata_table(&lua, "float", float_value.ptr() as *mut c_void)?;
+
+        let args = pack_args(
+            &lua,
+            vec![
+                LuaValue::LightUserData(LuaLightUserData(buffer.as_mut_ptr() as *mut c_void)),
+                LuaValue::Integer(buffer.len() as i64),
+                LuaValue::String(format),
+                LuaValue::Table(int_cdata),
+                LuaValue::Table(float_cdata),
+            ],
+        )?;
+
+        let func = LuaLightUserData(luneffi_test_variadic_format as *const () as *mut c_void);
+        let result = call(&lua, func, signature, args)?;
+        let written = match result {
+            LuaValue::Integer(value) => value,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        assert!(written > 0);
+
+        let c_str = unsafe { CStr::from_ptr(buffer.as_ptr()) };
+        assert_eq!(
+            c_str.to_str().unwrap(),
+            format!("{big_value_raw} {float_value_raw:.2}"),
+        );
         Ok(())
     }
 }
