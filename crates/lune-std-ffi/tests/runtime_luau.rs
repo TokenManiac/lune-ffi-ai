@@ -130,9 +130,9 @@ fn build_libcpr_library(repo_root: &Path) -> LuaResult<PathBuf> {
     let curl_lib = pkg_config::Config::new()
         .cargo_metadata(false)
         .probe("libcurl")
-        .map_err(|err| LuaError::external(format!(
-            "failed to locate libcurl with pkg-config: {err}"
-        )))?;
+        .map_err(|err| {
+            LuaError::external(format!("failed to locate libcurl with pkg-config: {err}"))
+        })?;
 
     let mut build = cc::Build::new();
     build.cpp(true);
@@ -269,9 +269,8 @@ fn build_libcpr_library(repo_root: &Path) -> LuaResult<PathBuf> {
 }
 
 fn spawn_libcpr_test_server() -> LuaResult<(String, String, thread::JoinHandle<()>)> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|err| {
-        LuaError::external(format!("failed to bind libcpr test server: {err}"))
-    })?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|err| LuaError::external(format!("failed to bind libcpr test server: {err}")))?;
     listener.set_nonblocking(true).map_err(|err| {
         LuaError::external(format!("failed to configure libcpr test server: {err}"))
     })?;
@@ -283,7 +282,8 @@ fn spawn_libcpr_test_server() -> LuaResult<(String, String, thread::JoinHandle<(
     let body = "Hello from libcpr";
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(), body
+        body.len(),
+        body
     );
     let response_bytes = response.into_bytes();
 
@@ -431,9 +431,9 @@ end
         .set_name("packages/ffi/tests/_runner.luau")
         .exec();
 
-    libcpr_server.join().map_err(|err| {
-        LuaError::external(format!("libcpr test server panicked: {err:?}"))
-    })?;
+    libcpr_server
+        .join()
+        .map_err(|err| LuaError::external(format!("libcpr test server panicked: {err:?}")))?;
 
     exec_result?;
 

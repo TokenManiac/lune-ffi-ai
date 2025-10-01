@@ -198,6 +198,28 @@ int luneffi_test_call_callback(RuntimeUnary cb, int value);]])
         assertEqual(total, 7)
     end)
 
+    test("ffi variadic calls honour cdata type information", function()
+        ffi.cdef([[int luneffi_test_variadic_format(char* buffer, size_t size, const char* fmt, ...);]])
+
+        local bufferSize = 128
+        local buffer = debugTools.alloc(bufferSize)
+        local fmt = "%lld %.2f"
+        local bigValue = 1234567890123
+
+        local written = ffi.C.luneffi_test_variadic_format(
+            buffer,
+            bufferSize,
+            fmt,
+            ffi.cast("long long", bigValue),
+            ffi.cast("float", 3.25)
+        )
+
+        assert(written > 0, "expected luneffi_test_variadic_format to succeed")
+        local output = ffi.string(buffer)
+        assertEqual(output, string.format("%d %.2f", bigValue, 3.25))
+        debugTools.free(buffer)
+    end)
+
     test("ffi.errno exposes native errno and allows overriding", function()
         local original = ffi.errno()
         local marker = 1337
