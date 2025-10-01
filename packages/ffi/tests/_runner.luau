@@ -29,12 +29,16 @@ local registry = {
     test = test,
     assertEqual = assertEqual,
     exampleLibraryPath = rawget(_G, "FFI_EXAMPLE_LIBRARY_PATH"),
+    libcprLibraryPath = rawget(_G, "FFI_LIBCPR_LIBRARY_PATH"),
+    libcprUrl = rawget(_G, "FFI_LIBCPR_TEST_URL"),
+    libcprExpectedBody = rawget(_G, "FFI_LIBCPR_EXPECTED_BODY"),
 }
 
 local modules = {
     require("./cdef_spec"),
     require("./runtime_spec"),
     require("./example_spec"),
+    require("./libcpr_spec"),
 }
 
 for _, register in ipairs(modules) do

@@ -1725,6 +1725,7 @@ dependencies = [
  "libffi",
  "lune-utils",
  "mlua",
+ "pkg-config",
 ]
 
 [[package]]

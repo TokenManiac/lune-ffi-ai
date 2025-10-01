@@ -22,3 +22,4 @@ lune-utils = { version = "0.3.2", path = "../lune-utils" }
 
 [dev-dependencies]
 cc = "1.1"
+pkg-config = "0.3"
