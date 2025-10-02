@@ -115,7 +115,7 @@ print("Callback invoked", total, "time(s)")
 | --- | --- | --- |
 | `ffi.cdef` | ⚠️ | Typedefs, enums, structs/unions, function prototypes supported (arrays/nested declarators pending). |
 | `ffi.C` / `ffi.load` | ✅ | Process handle exposed; named libraries cached with automatic `dlclose` on GC. |
-| `ffi.new` / `ffi.cast` / `ffi.typeof` | ⚠️ | Primitives and pointers supported; structured allocations are TODO. |
+| `ffi.new` / `ffi.cast` / `ffi.typeof` | ✅ | Primitives, pointers, and structured values (records/enums) supported. |
 | `ffi.gc` | ✅ | Finalizers on cdata tables; lightuserdata support TODO. |
 | `ffi.metatype` | ⚠️ | Metamethods for pointers/records cached; field access helpers forthcoming. |
 | `ffi.string` | ✅ | Reads NUL-terminated or length-bounded buffers. |

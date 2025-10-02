@@ -47,3 +47,48 @@ LUNEFFI_TEST_EXPORT int luneffi_test_call_callback(luneffi_unary_callback cb, in
     }
     return cb(value);
 }
+
+typedef struct {
+    int x;
+    double y;
+} RuntimeStructInit;
+
+LUNEFFI_TEST_EXPORT int luneffi_test_struct_get_x(const RuntimeStructInit* value) {
+    return value != NULL ? value->x : 0;
+}
+
+LUNEFFI_TEST_EXPORT double luneffi_test_struct_get_y(const RuntimeStructInit* value) {
+    return value != NULL ? value->y : 0.0;
+}
+
+typedef struct {
+    int* target;
+    int flag;
+} RuntimePointerStruct;
+
+LUNEFFI_TEST_EXPORT int luneffi_test_pointer_struct_flag(const RuntimePointerStruct* value) {
+    return value != NULL ? value->flag : -1;
+}
+
+LUNEFFI_TEST_EXPORT int luneffi_test_pointer_struct_read(const RuntimePointerStruct* value) {
+    if (value == NULL || value->target == NULL) {
+        return -1;
+    }
+    return *value->target;
+}
+
+typedef union {
+    int as_int;
+    void* as_ptr;
+} RuntimeTaggedUnion;
+
+LUNEFFI_TEST_EXPORT int luneffi_test_union_int(const RuntimeTaggedUnion* value) {
+    return value != NULL ? value->as_int : 0;
+}
+
+LUNEFFI_TEST_EXPORT int luneffi_test_union_is_ptr(const RuntimeTaggedUnion* value, void* ptr) {
+    if (value == NULL) {
+        return 0;
+    }
+    return value->as_ptr == ptr;
+}
