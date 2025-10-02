@@ -1825,6 +1825,75 @@ local function with_pointer_scratch(callback: (NativeHandle) -> any)
     error(result, 3)
 end
 
+local function pointer_add(base: NativeHandle, offset: number): NativeHandle
+    if type(offset) ~= "number" then
+        error("pointer offset must be numeric", 3)
+    end
+    if offset == 0 then
+        return base
+    end
+    if offset < 0 then
+        error("pointer offset must be non-negative", 3)
+    end
+    if offset % 1 ~= 0 then
+        error("pointer offset must be integral", 3)
+    end
+
+    local integral = offset
+    return with_pointer_scratch(function(scratch)
+        local okStore, storeErr = pcall(native.storeScalar, scratch, "pointer", base)
+        if not okStore then
+            error(storeErr, 3)
+        end
+
+        local okAddr, addrOrErr = pcall(native.loadScalar, scratch, "uintptr_t")
+        if not okAddr then
+            error(addrOrErr, 3)
+        end
+        local address = addrOrErr
+        if type(address) ~= "number" then
+            error("native.loadScalar returned non-numeric pointer address", 3)
+        end
+
+        local resultAddress = address + integral
+        if resultAddress < 0 then
+            error("pointer arithmetic produced negative address", 3)
+        end
+
+        local okStoreAddr, storeAddrErr = pcall(native.storeScalar, scratch, "uintptr_t", resultAddress)
+        if not okStoreAddr then
+            error(storeAddrErr, 3)
+        end
+
+        local okLoadPtr, ptrOrErr = pcall(native.loadScalar, scratch, "pointer")
+        if not okLoadPtr then
+            error(ptrOrErr, 3)
+        end
+
+        return ptrOrErr :: NativeHandle
+    end)
+end
+
+local function copy_memory(dest: NativeHandle, source: NativeHandle?, size: number)
+    if size <= 0 then
+        return
+    end
+    if source == nil then
+        error("cannot copy from null pointer", 3)
+    end
+
+    local okRead, dataOrErr = pcall(native.readString, source :: NativeHandle, size)
+    if not okRead then
+        error(dataOrErr, 3)
+    end
+    local bytes = dataOrErr
+
+    local okWrite, writeErr = pcall(native.writeBytes, dest, bytes, false)
+    if not okWrite then
+        error(writeErr, 3)
+    end
+end
+
 local function convert_scalar_to_pointer(value: any): NativeHandle?
     return with_pointer_scratch(function(scratch)
         local ok, err = pcall(native.storeScalar, scratch, "pointer", value)
@@ -1879,6 +1948,248 @@ local function coerce_pointer_value(value: any): NativeHandle?
         return nil
     else
         error("cannot convert value to pointer", 3)
+    end
+end
+
+local function get_scalar_code(descriptor: CType): string
+    if descriptor.kind == "primitive" then
+        return descriptor.code
+    elseif descriptor.kind == "enum" then
+        return "int"
+    end
+    error(string.format("type '%s' is not a scalar", descriptor.name), 3)
+end
+
+local function is_unsigned_code(code: string?): boolean
+    if type(code) ~= "string" then
+        return false
+    end
+    local lowered = code:lower()
+    return lowered:find("unsigned", 1, true) ~= nil or lowered:find("uint", 1, true) ~= nil
+end
+
+local store_value
+local assign_record_value
+
+local function write_bitfield_value(basePtr: NativeHandle, field: RecordField, value: any)
+    local width = field.bitWidth
+    if not width or width <= 0 then
+        return
+    end
+
+    local containerType = field.ctype
+    local totalBits = get_type_size(containerType) * 8
+    local shift = field.bitOffset or 0
+
+    if totalBits <= 0 then
+        error("bitfield container has zero size", 3)
+    end
+    if width > 52 or shift + width > 52 or totalBits > 52 then
+        error("bitfield assignments wider than 52 bits not supported", 3)
+    end
+
+    local numeric
+    local valueType = type(value)
+    if valueType == "boolean" then
+        numeric = if value then 1 else 0
+    elseif valueType == "number" then
+        if value ~= value or value == math.huge or value == -math.huge then
+            error("bitfield value must be finite", 3)
+        end
+        numeric = value
+    else
+        error("bitfield value must be numeric or boolean", 3)
+    end
+
+    if math.floor(numeric + 0.0) ~= numeric then
+        error("bitfield value must be integral", 3)
+    end
+
+    local signedField = not is_unsigned_code(containerType.code)
+    local range = 2 ^ width
+    local minValue = if signedField then -(range / 2) else 0
+    local maxValue = if signedField then (range / 2) - 1 else range - 1
+
+    if numeric < minValue or numeric > maxValue then
+        error(string.format("bitfield value %d out of range", numeric), 3)
+    end
+
+    local unsignedValue = if signedField and numeric < 0 then numeric + range else numeric
+
+    local containerPtr = pointer_add(basePtr, field.offset or 0)
+    local okRead, currentOrErr = pcall(native.loadScalar, containerPtr, containerType.code)
+    if not okRead then
+        error(currentOrErr, 3)
+    end
+
+    local currentValue = currentOrErr
+    if type(currentValue) ~= "number" then
+        error("bitfield container read produced non-numeric value", 3)
+    end
+
+    local containerUnsigned = currentValue
+    if containerUnsigned < 0 then
+        containerUnsigned += 2 ^ totalBits
+    end
+
+    local lowerMask = 2 ^ shift
+    local lower = if shift == 0 then 0 else containerUnsigned % lowerMask
+    local upperFactor = 2 ^ (shift + width)
+    local higher = math.floor(containerUnsigned / upperFactor)
+    local resultUnsigned = lower + unsignedValue * lowerMask + higher * upperFactor
+
+    local storeNumeric
+    if is_unsigned_code(containerType.code) then
+        storeNumeric = resultUnsigned
+    else
+        local signThreshold = 2 ^ (totalBits - 1)
+        if resultUnsigned >= signThreshold then
+            storeNumeric = resultUnsigned - 2 ^ totalBits
+        else
+            storeNumeric = resultUnsigned
+        end
+    end
+
+    local okStore, storeErr = pcall(native.storeScalar, containerPtr, containerType.code, storeNumeric)
+    if not okStore then
+        error(storeErr, 3)
+    end
+end
+
+local function initialize_record_from_table(ptr: NativeHandle, descriptor: CType, init: { [any]: any })
+    ensure_layout(descriptor)
+    local fields = descriptor.fields
+    if not fields then
+        return
+    end
+
+    if descriptor.kind == "union" then
+        local selectedField: RecordField? = nil
+        local selectedValue: any = nil
+        local arrayIndex = 1
+
+        for _, field in ipairs(fields) do
+            local value = init[field.name]
+            if value == nil then
+                value = init[arrayIndex]
+                if value ~= nil then
+                    arrayIndex += 1
+                end
+            end
+            if value ~= nil then
+                selectedField = field
+                selectedValue = value
+                break
+            end
+        end
+
+        if selectedField ~= nil then
+            if selectedField.bitWidth ~= nil then
+                write_bitfield_value(ptr, selectedField, selectedValue)
+            else
+                local fieldPtr = pointer_add(ptr, selectedField.offset or 0)
+                assert(store_value ~= nil)
+                store_value(fieldPtr, selectedField.ctype, selectedValue)
+            end
+        end
+        return
+    end
+
+    local arrayIndex = 1
+    for _, field in ipairs(fields) do
+        local value = init[field.name]
+        if value == nil then
+            value = init[arrayIndex]
+            if value ~= nil then
+                arrayIndex += 1
+            end
+        end
+        if value ~= nil then
+            if field.bitWidth ~= nil then
+                write_bitfield_value(ptr, field, value)
+            else
+                local fieldPtr = pointer_add(ptr, field.offset or 0)
+                assert(store_value ~= nil)
+                store_value(fieldPtr, field.ctype, value)
+            end
+        end
+    end
+end
+
+assign_record_value = function(ptr: NativeHandle, descriptor: CType, value: any)
+    if value == nil then
+        return
+    end
+
+    local valueType = type(value)
+    if valueType == "table" then
+        if is_cdata(value) then
+            local valueDescriptor = resolve_ctype(value)
+            if valueDescriptor.kind == "pointer" then
+                local base = valueDescriptor.base
+                if base ~= descriptor then
+                    if not (base and base.kind == "primitive" and base.code == "void") then
+                        error(string.format("cannot initialize %s from pointer to %s", descriptor.name, base and base.name or "<unknown>"), 3)
+                    end
+                end
+                local sourcePtr = coerce_pointer_value(value)
+                if sourcePtr == nil then
+                    error(string.format("cannot copy from null pointer into %s", descriptor.name), 3)
+                end
+                copy_memory(ptr, sourcePtr, get_type_size(descriptor))
+            else
+                if valueDescriptor ~= descriptor then
+                    error(string.format("expected value of type '%s'", descriptor.name), 3)
+                end
+                local sourcePtr = rawget(value, "__ptr")
+                if sourcePtr == nil then
+                    error("cdata value missing native pointer", 3)
+                end
+                copy_memory(ptr, sourcePtr :: NativeHandle, get_type_size(descriptor))
+            end
+        else
+            initialize_record_from_table(ptr, descriptor, value)
+        end
+    elseif valueType == "userdata" then
+        copy_memory(ptr, value :: NativeHandle, get_type_size(descriptor))
+    elseif valueType == "string" then
+        local size = get_type_size(descriptor)
+        if #value < size then
+            error(string.format("initializer string too short for type '%s'", descriptor.name), 3)
+        end
+        local slice = if #value == size then value else value:sub(1, size)
+        local okWrite, writeErr = pcall(native.writeBytes, ptr, slice, false)
+        if not okWrite then
+            error(writeErr, 3)
+        end
+    else
+        error(string.format("cannot initialize %s from value of type '%s'", descriptor.name, valueType), 3)
+    end
+end
+
+store_value = function(ptr: NativeHandle, descriptor: CType, value: any)
+    local kind = descriptor.kind
+    if kind == "primitive" then
+        local ok, err = pcall(native.storeScalar, ptr, descriptor.code, value)
+        if not ok then
+            error(err, 3)
+        end
+    elseif kind == "enum" then
+        local ok, err = pcall(native.storeScalar, ptr, "int", value)
+        if not ok then
+            error(err, 3)
+        end
+    elseif kind == "pointer" then
+        local pointerValue = coerce_pointer_value(value)
+        local ok, err = pcall(native.storeScalar, ptr, "pointer", pointerValue)
+        if not ok then
+            error(err, 3)
+        end
+    elseif kind == "struct" or kind == "union" then
+        assert(assign_record_value ~= nil)
+        assign_record_value(ptr, descriptor, value)
+    else
+        error(string.format("cannot assign value to type '%s'", descriptor.name), 3)
     end
 end
 
@@ -2050,6 +2361,47 @@ local function create_cdata(descriptor: CType, pointer: NativeHandle?, owned: bo
     return setmetatable(object, cdata_mt)
 end
 
+local function allocate_scalar(descriptor: CType, init: any?): any
+    local size = get_type_size(descriptor)
+    local ptr = native.alloc(size)
+
+    local ok, err = pcall(function()
+        if init ~= nil then
+            local code = get_scalar_code(descriptor)
+            local okStore, storeErr = pcall(native.storeScalar, ptr, code, init)
+            if not okStore then
+                error(storeErr, 3)
+            end
+        end
+    end)
+
+    if not ok then
+        native.free(ptr)
+        error(err, 3)
+    end
+
+    return create_cdata(descriptor, ptr, true)
+end
+
+local function allocate_record(descriptor: CType, init: any?): any
+    local size = get_type_size(descriptor)
+    local ptr = native.alloc(size)
+
+    local ok, err = pcall(function()
+        if init ~= nil then
+            assert(assign_record_value ~= nil)
+            assign_record_value(ptr, descriptor, init)
+        end
+    end)
+
+    if not ok then
+        native.free(ptr)
+        error(err, 3)
+    end
+
+    return create_cdata(descriptor, ptr, true)
+end
+
 local ffi = {}
 
 function ffi.cdef(header: string)
@@ -2130,39 +2482,24 @@ function ffi.typeof(spec: any): CType
     return resolve_ctype(spec)
 end
 
-local function allocate_primitive(descriptor: CType, init: any?): any
-    local size = get_type_size(descriptor)
-    local ptr = native.alloc(size)
-
-    local ok, err = pcall(function()
-        if init ~= nil then
-            native.storeScalar(ptr, descriptor.code, init)
-        end
-    end)
-
-    if not ok then
-        native.free(ptr)
-        error(err, 3)
-    end
-
-    return create_cdata(descriptor, ptr, true)
-end
-
 function ffi.new(spec: any, ...): any
     local descriptor = resolve_ctype(spec)
 
-    if descriptor.kind == "primitive" then
+    if descriptor.kind == "primitive" or descriptor.kind == "enum" then
         local init = if select("#", ...) >= 1 then select(1, ...) else nil
-        return allocate_primitive(descriptor, init)
+        return allocate_scalar(descriptor, init)
     elseif descriptor.kind == "pointer" then
         local pointerValue: NativeHandle? = nil
         if select("#", ...) >= 1 then
             pointerValue = coerce_pointer_value(select(1, ...))
         end
         return create_cdata(descriptor, pointerValue, false)
+    elseif descriptor.kind == "struct" or descriptor.kind == "union" then
+        local init = if select("#", ...) >= 1 then select(1, ...) else nil
+        return allocate_record(descriptor, init)
     end
 
-    error(string.format("TODO(@lune/ffi/new): allocation for type '%s' not implemented", descriptor.name), 2)
+    error(string.format("ffi.new does not support type '%s'", descriptor.name), 2)
 end
 
 function ffi.cast(spec: any, value: any): any
@@ -2191,11 +2528,13 @@ function ffi.cast(spec: any, value: any): any
             rawset(object, "__callback_handle", callbackHandle)
         end
         return object
-    elseif descriptor.kind == "primitive" then
-        return allocate_primitive(descriptor, value)
+    elseif descriptor.kind == "primitive" or descriptor.kind == "enum" then
+        return allocate_scalar(descriptor, value)
+    elseif descriptor.kind == "struct" or descriptor.kind == "union" then
+        return allocate_record(descriptor, value)
     end
 
-    error(string.format("TODO(@lune/ffi/cast): casting to type '%s' not implemented", descriptor.name), 2)
+    error(string.format("ffi.cast does not support type '%s'", descriptor.name), 2)
 end
 
 function ffi.string(value: any, len: number?): string

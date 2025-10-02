@@ -4,7 +4,7 @@
 - [x] Implement loader native shim (POSIX/Windows) + Luau wrapper
 - [x] Implement call bridge (cdecl + Windows stdcall/ms_abi), basic varargs *(TODO: richer cdata varargs + parser integration)*
 - [x] `ffi.cdef` parser (typedefs, enums, structs/unions, bitfields basic) *(arrays/nested declarators still TODO)*
-- [x] `ffi.new`, `ffi.typeof`, `ffi.cast`, `ffi.string`
+- [x] `ffi.new`, `ffi.typeof`, `ffi.cast`, `ffi.string` *(record/enum allocation now supported)*
 - [x] `ffi.sizeof`, `ffi.alignof`, `ffi.offsetof`
 - [x] `ffi.C`, `ffi.load`, symbol cache
 - [x] `ffi.metatype`, `ffi.gc`

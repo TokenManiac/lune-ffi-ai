@@ -4,6 +4,29 @@ return function(ctx)
     local assertEqual = ctx.assertEqual
     local debugTools = ffi._debug
 
+    ffi.cdef([[typedef struct {
+        int x;
+        double y;
+    } RuntimeStructInit;
+
+    typedef struct {
+        int* target;
+        int flag;
+    } RuntimePointerStruct;
+
+    typedef union {
+        int as_int;
+        void* as_ptr;
+    } RuntimeTaggedUnion;
+
+    int luneffi_test_struct_get_x(const RuntimeStructInit* value);
+    double luneffi_test_struct_get_y(const RuntimeStructInit* value);
+    int luneffi_test_pointer_struct_flag(const RuntimePointerStruct* value);
+    int luneffi_test_pointer_struct_read(const RuntimePointerStruct* value);
+    int luneffi_test_union_int(const RuntimeTaggedUnion* value);
+    int luneffi_test_union_is_ptr(const RuntimeTaggedUnion* value, void* ptr);
+    ]])
+
     test("ffi.typeof resolves strings, descriptors, and cdata", function()
         local intType = ffi.typeof("int")
         assertEqual(intType.code, "int")
@@ -24,6 +47,40 @@ return function(ctx)
         assertEqual(debugTools.readScalar(fortyTwo), 42)
     end)
 
+    test("ffi.new allocates structs and unions", function()
+        local pair = ffi.new("RuntimeStructInit", { x = 7, y = 3.5 })
+        local pairPtr = ffi.new("RuntimeStructInit*", pair)
+        assertEqual(ffi.C.luneffi_test_struct_get_x(pairPtr), 7)
+        assertEqual(ffi.C.luneffi_test_struct_get_y(pairPtr), 3.5)
+
+        local copyFromPointer = ffi.new("RuntimeStructInit", pairPtr)
+        local copyPtr = ffi.new("RuntimeStructInit*", copyFromPointer)
+        assertEqual(ffi.C.luneffi_test_struct_get_x(copyPtr), 7)
+        assertEqual(ffi.C.luneffi_test_struct_get_y(copyPtr), 3.5)
+
+        local positional = ffi.new("RuntimeStructInit", { 11, 9.75 })
+        local positionalPtr = ffi.new("RuntimeStructInit*", positional)
+        assertEqual(ffi.C.luneffi_test_struct_get_x(positionalPtr), 11)
+        assertEqual(ffi.C.luneffi_test_struct_get_y(positionalPtr), 9.75)
+
+        local storedInt = ffi.new("int", 64)
+        local pointerStruct = ffi.new("RuntimePointerStruct", {
+            target = storedInt,
+            flag = 3,
+        })
+        local pointerStructPtr = ffi.new("RuntimePointerStruct*", pointerStruct)
+        assertEqual(ffi.C.luneffi_test_pointer_struct_flag(pointerStructPtr), 3)
+        assertEqual(ffi.C.luneffi_test_pointer_struct_read(pointerStructPtr), 64)
+
+        local unionFromTable = ffi.new("RuntimeTaggedUnion", { as_int = 128 })
+        local unionPtr = ffi.new("RuntimeTaggedUnion*", unionFromTable)
+        assertEqual(ffi.C.luneffi_test_union_int(unionPtr), 128)
+
+        local unionFromPointer = ffi.new("RuntimeTaggedUnion", { as_ptr = pointerStructPtr })
+        local unionPtr2 = ffi.new("RuntimeTaggedUnion*", unionFromPointer)
+        assertEqual(ffi.C.luneffi_test_union_is_ptr(unionPtr2, pointerStructPtr), 1)
+    end)
+
     test("ffi.cast produces pointer and primitive cdata", function()
         local source = ffi.new("int", 11)
         local pointer = ffi.cast("int*", source)
@@ -34,6 +91,26 @@ return function(ctx)
 
         local copied = ffi.cast("int", 123)
         assertEqual(debugTools.readScalar(copied), 123)
+    end)
+
+    test("ffi.cast copies structured values", function()
+        local original = ffi.new("RuntimeStructInit", { x = 21, y = 4.25 })
+        local originalPtr = ffi.new("RuntimeStructInit*", original)
+
+        local castFromPointer = ffi.cast("RuntimeStructInit", originalPtr)
+        local castPtr = ffi.new("RuntimeStructInit*", castFromPointer)
+        assertEqual(ffi.C.luneffi_test_struct_get_x(castPtr), 21)
+        assertEqual(ffi.C.luneffi_test_struct_get_y(castPtr), 4.25)
+
+        local castFromValue = ffi.cast("RuntimeStructInit", original)
+        local castPtr2 = ffi.new("RuntimeStructInit*", castFromValue)
+        assertEqual(ffi.C.luneffi_test_struct_get_x(castPtr2), 21)
+        assertEqual(ffi.C.luneffi_test_struct_get_y(castPtr2), 4.25)
+
+        local pointerTarget = ffi.new("int", 255)
+        local castUnion = ffi.cast("RuntimeTaggedUnion", { as_ptr = pointerTarget })
+        local castUnionPtr = ffi.new("RuntimeTaggedUnion*", castUnion)
+        assertEqual(ffi.C.luneffi_test_union_is_ptr(castUnionPtr, pointerTarget), 1)
     end)
 
     test("ffi.string reads C strings from pointers", function()
